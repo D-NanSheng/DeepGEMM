@@ -10,6 +10,7 @@
 #include <cute/arch/copy_sm90_desc.hpp>
 #include <cute/arch/copy_sm90_tma.hpp>
 
+#include <deep_gemm/common/epilogue_utils.cuh>
 #include <deep_gemm/common/utils.cuh>
 #include <deep_gemm/common/scheduler.cuh>
 #include <deep_gemm/common/sm90_utils.cuh>
@@ -18,15 +19,15 @@ namespace deep_gemm {
 
 using namespace deep_gemm::sm90;
 
-template <uint32_t kNumFormerIters, uint32_t kGap, uint32_t kEnd>
-__device__ __host__ void outer_launch_k_iterations(const auto& inner_launch_k_iterations, const auto& func, uint32_t num_former_iters) {
+template <uint32_t kNumFormerIters, uint32_t kGap, uint32_t kEnd, typename func_t>
+__device__ void dispatch_num_former_iters(uint32_t num_former_iters, const func_t& func) {
     if (num_former_iters == kNumFormerIters) {
-        inner_launch_k_iterations(func, cute::Int<kNumFormerIters>{});
+        func(cute::Int<kNumFormerIters>{});
         return;
     }
 
     if constexpr (kNumFormerIters + kGap <= kEnd)
-        outer_launch_k_iterations<kNumFormerIters + kGap, kGap, kEnd>(inner_launch_k_iterations, func, num_former_iters);
+        dispatch_num_former_iters<kNumFormerIters + kGap, kGap, kEnd>(num_former_iters, func);
 }
 // BLOCK_M, BLOCK_N, BLOCK_K，编译阶段的优化参数，表示不同维度切分块的大小
 // A(M×K) × B(K×N) = D(M×N)
@@ -37,7 +38,8 @@ template <uint32_t SHAPE_M, uint32_t SHAPE_N, uint32_t SHAPE_K,
           uint32_t kNumStages, uint32_t kNumLastStages,
           uint32_t kNumTMAThreads, uint32_t kNumMathThreads,
           uint32_t kNumTMAMulticast, bool kIsTMAMulticastOnA,
-          uint32_t kNumSMs, GemmType kGemmType>
+          uint32_t kNumSMs, GemmType kGemmType,
+          typename epilogue_type_t>
 __global__ __launch_bounds__(kNumTMAThreads + kNumMathThreads, 1) void
 sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
                         uint32_t shape_m, uint32_t shape_n, uint32_t shape_k,
@@ -72,16 +74,12 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
     const uint32_t& smem_sfb_size = align<uint32_t>(shape_k_scales * (kMustUseUniformedScaleB ? 1 : 2) * sizeof(float), sizeof(Barrier)); // 计算共享内存中存储B的缩放因子（SFB）所需的空间，并确保内存对齐
 
     // Configs
-    constexpr uint32_t kFullKOfAllStages = kNumStages * BLOCK_K; // 计算所有存储阶段（stage）能覆盖的 K 维度总长度。 kNumStages是流水线阶段数量，最小两阶段，计算+数据加载。
-    const uint32_t num_iterations = ceil_div(shape_k, kFullKOfAllStages); // 计算处理整个 K 维度需要的总迭代次数。
-    const uint32_t warp_idx = __shfl_sync(0xffffffff, threadIdx.x / 32, 0); // 获取当前线程所在的warp（线程束）索引
-    const uint32_t lane_idx = get_lane_idx(); // 获取当前线程在warp 内的车道索引（lane index）（lane 0 到 lane 31）
+    const uint32_t num_total_k_blocks = ceil_div(shape_k, BLOCK_K);
+    const uint32_t warp_idx = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
+    const uint32_t lane_idx = get_lane_idx();
 
     // Prefetch TMA descriptors at the very beginning
-    if (threadIdx.x == kNumMathThreads) { // 指定一个专门的辅助线程（而非负责核心计算的线程）执行预取操作
-        // NOTES: `reinterpret_cast` must be here, or NVRTC will fail
-        // TmaDescriptor包含张量的内存地址、形状、步长、数据类型等信息，是 TMA 操作的 “说明书”——TMA 硬件需要根据描述符才能正确传输数据
-        // cute::prefetch_tma_descriptor函数：将 TMA 描述符从全局内存预加载到更靠近 SM（流多处理器）的缓存（如 L2 缓存或 SM 的本地缓存）中，加快后续访问速度
+    if (warp_idx == kNumMathThreads / 32 and cute::elect_one_sync()) {
         cute::prefetch_tma_descriptor(&tensor_map_a);
         cute::prefetch_tma_descriptor(&tensor_map_b);
         cute::prefetch_tma_descriptor(&tensor_map_sfa);
@@ -94,36 +92,27 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
     DG_STATIC_ASSERT(SMEM_D_SIZE % 1024 == 0, "Shared memory of A/B must be aligned to 1024 bytes");
 
     // Data on shared memory
-    auto smem_d = reinterpret_cast<__nv_bfloat16*>(smem_buffer); // // 输出矩阵D的存储区域（bfloat16类型，用于暂存计算结果）
-    __nv_fp8_e4m3* smem_a[kNumStages]; // 输入矩阵A的存储区域（FP8类型，多阶段流水线用，kNumStages是流水线阶段数）
-    __nv_fp8_e4m3* smem_b[kNumStages]; // 输入矩阵B的存储区域（FP8类型，多阶段流水线用，kNumStages是流水线阶段数）
-    float* smem_sfa[kNumStages]; // 矩阵A的缩放因子存储区域（float类型，FP8计算需要缩放以保证精度）
-    float* smem_sfb; // 矩阵B的缩放因子存储区域（float类型）
-
-    // TMA Barrier for both divisible and non-divisible cases // TMA数据传输的同步屏障（用于协调数据加载/计算的时序）
-    Barrier* full_barriers[kNumStages]; // 表示 “共享内存区域已填满数据” 的屏障，通知计算线程可以读取该区域数据
-    Barrier* empty_barriers[kNumStages]; // 表示 “共享内存区域已被消费（数据已计算完毕）” 的屏障，通知 TMA 线程可以重新填充新数据
-
-    // Fill shared memory pointers 划分smem_buffer作为多个子区域
-    #pragma unroll // #pragma unroll指令会强制编译器展开循环
-    for (uint32_t i = 0; i < kNumStages; ++ i) {
-        smem_a[i] = reinterpret_cast<__nv_fp8_e4m3*>(smem_buffer + SMEM_D_SIZE + i * SMEM_A_SIZE_PER_STAGE);
-        smem_b[i] = reinterpret_cast<__nv_fp8_e4m3*>(smem_buffer + SMEM_D_SIZE + kNumStages * SMEM_A_SIZE_PER_STAGE + i * SMEM_B_SIZE_PER_STAGE);
-        smem_sfa[i] = reinterpret_cast<float*>(smem_buffer + SMEM_D_SIZE + kNumStages * (SMEM_A_SIZE_PER_STAGE + SMEM_B_SIZE_PER_STAGE) + i * SMEM_SFA_SIZE_PER_STAGE);
-    }
-    smem_sfb = reinterpret_cast<float*>(smem_buffer + SMEM_D_SIZE + kNumStages * (SMEM_A_SIZE_PER_STAGE + SMEM_B_SIZE_PER_STAGE + SMEM_SFA_SIZE_PER_STAGE));
+    auto smem_d = reinterpret_cast<__nv_bfloat16*>(smem_buffer);
+    auto smem_a = PatternVisitor([&](const uint32_t& i) {
+        return reinterpret_cast<__nv_fp8_e4m3*>(smem_buffer + SMEM_D_SIZE + i * SMEM_A_SIZE_PER_STAGE);
+    });
+    auto smem_b = PatternVisitor([&](const uint32_t& i) {
+        return reinterpret_cast<__nv_fp8_e4m3*>(smem_buffer + SMEM_D_SIZE + kNumStages * SMEM_A_SIZE_PER_STAGE + i * SMEM_B_SIZE_PER_STAGE);
+    });
+    constexpr uint32_t SMEM_SF_OFFSET = SMEM_D_SIZE + kNumStages * (SMEM_A_SIZE_PER_STAGE + SMEM_B_SIZE_PER_STAGE);
+    auto smem_sfa = PatternVisitor([&](const uint32_t& i) {
+        return reinterpret_cast<float*>(smem_buffer + SMEM_SF_OFFSET + i * SMEM_SFA_SIZE_PER_STAGE);
+    });
+    auto smem_sfb = reinterpret_cast<float*>(smem_buffer + SMEM_SF_OFFSET + kNumStages * SMEM_SFA_SIZE_PER_STAGE);
 
     // Fill barriers 为每个stage分配一个full_barrier和empty_barrier
     auto barrier_start_ptr = reinterpret_cast<Barrier*>(reinterpret_cast<uint8_t*>(smem_sfb) + smem_sfb_size);
-    #pragma unroll
-    for (uint32_t i = 0; i < kNumStages; ++ i) {
-        full_barriers[i] = barrier_start_ptr + i;
-        empty_barriers[i] = barrier_start_ptr + kNumStages + i;
-    }
+    auto full_barriers     = PatternVisitor([&](const uint32_t& i) { return barrier_start_ptr + i; });
+    auto empty_barriers    = PatternVisitor([&](const uint32_t& i) { return barrier_start_ptr + kNumStages + i; });
 
     // Initialize barriers
-    DG_STATIC_ASSERT(kNumTMAMulticast <= 32, "Too many TMA multicast"); // 通过 TMA 同时向多个 CTA 传输数据的数量不能超过 32
-    if (threadIdx.x == kNumMathThreads) { // 特定线程负责屏障初始化
+    DG_STATIC_ASSERT(kNumTMAMulticast <= 32, "Too many TMA multicast");
+    if (warp_idx == kNumMathThreads / 32 + 1 and cute::elect_one_sync()) {
         // NOTES: we always use `lane_idx` to arrive for the `lane_idx`-th CTA in the cluster,
         // even with TMA multicast disabled, we want to make the behavior aligned
         #pragma unroll
@@ -133,42 +122,11 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
         }
 
         // Make initialized barrier visible in async proxy  内存屏障（fence），用于确保屏障的初始化状态被所有线程（包括其他 CTA 的线程）可见
-        cutlass::arch::fence_view_async_shared();
         cutlass::arch::fence_barrier_init();
     }
 
     // Synchronize all threads to make barrier visible in normal memory model
     (kNumTMAMulticast > 1) ? cute::cluster_sync() : __syncthreads();
-
-    // For pipeline unrolling 通过DivisibleK/NotDivisibleK告诉func当前 K 迭代是否可分（影响数据加载范围）；通过SkipComputation/NotSkipComputation告诉func是否需要执行计算（如某些场景下只需加载数据无需计算）
-    struct DivisibleK {};         // 标记K维度可被流水线总步长整除的情况， 这些是空结构体，仅作为编译期标签使用
-    struct NotDivisibleK {};      // 标记K维度不可被流水线总步长整除的情况， 这些是空结构体，仅作为编译期标签使用
-    struct SkipComputation {};    // 标记需要跳过计算的情况， 这些是空结构体，仅作为编译期标签使用
-    struct NotSkipComputation {}; // 标记需要执行计算的情况， 这些是空结构体，仅作为编译期标签使用
-    auto launch_k_iterations = [=](const auto& func, bool skip_computation, uint32_t num_former_iters) {
-        constexpr bool kShouldOptimize = BLOCK_K / constexpr_gcd(BLOCK_K, BLOCK_N) <= 4 and not kMustUseUniformedScaleB;
-        constexpr uint32_t kGap = constexpr_gcd(BLOCK_K, BLOCK_N) / 8;
-        constexpr uint32_t kEnd = kShouldOptimize ? BLOCK_K / 8 : 0;
-
-        // NOTES: for too-many branches (> 5), we disable this optimization
-        // Otherwise, the compiler must know the dynamic variable `num_former_iters`'s real value
-        outer_launch_k_iterations<0, kGap, kEnd>([=](const auto& func, auto num_former_iters_type) {
-            if (skip_computation) {
-                // 跳过计算的场景：对所有K迭代，传递DivisibleK和SkipComputation标签
-                for (uint32_t k_iter = 0; k_iter < num_iterations; ++ k_iter)
-                    func(k_iter, DivisibleK{}, SkipComputation{}, num_former_iters_type);
-            } else if (shape_k % kFullKOfAllStages == 0) {
-                // K维度可分的场景：对所有K迭代，传递DivisibleK和NotSkipComputation标签
-                for (uint32_t k_iter = 0; k_iter < num_iterations; ++ k_iter)
-                    func(k_iter, DivisibleK{}, NotSkipComputation{}, num_former_iters_type);
-            } else {
-                // K维度不可分的场景：前n-1次迭代用DivisibleK，最后一次用NotDivisibleK
-                for (uint32_t k_iter = 0; k_iter < num_iterations - 1; ++ k_iter)
-                    func(k_iter, DivisibleK{}, NotSkipComputation{}, num_former_iters_type);
-                func(num_iterations - 1, NotDivisibleK{}, NotSkipComputation{}, num_former_iters_type);
-            }
-        }, func, kShouldOptimize ? num_former_iters : 0);
-    };
 
     // Register reconfigurations
     constexpr uint32_t kNumTMARegisters = 40; // TMA线程使用的寄存器数量
@@ -186,68 +144,60 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
     // 构造参数：动态输入信息，包括：
     // shape_m/shape_n：输入矩阵A/B的整体大小（M/N 维度）；
     // grouped_layout：分组布局信息（用于分组 GEMM，指定每组的矩阵大小）。
-    auto scheduler = Scheduler<kGemmType, BLOCK_M, BLOCK_N, kNumGroups, kNumTMAMulticast, kIsTMAMulticastOnA, kNumSMs>(shape_m, shape_n, grouped_layout);
+    auto scheduler = Scheduler<kGemmType, BLOCK_M, BLOCK_N, kNumGroups, kNumTMAMulticast, kIsTMAMulticastOnA, kNumSMs>(shape_m, shape_n, shape_k, grouped_layout);
 
-    if (threadIdx.x >= kNumMathThreads) { // 当前属于 TMA 线程
+    // Pipeline and TMA phases
+    uint32_t stage_idx = 0, phase = 0;
+    auto advance_pipeline = [&](uint32_t& k_block_idx) {
+        ++ k_block_idx;
+
+        // Flip phases only if reach the next first stage
+        stage_idx = stage_idx == kNumStages - 1 ? 0 : stage_idx + 1;
+        phase ^= stage_idx == 0;
+    };
+
+    if (warp_idx >= kNumMathThreads / 32) { // 当前属于 TMA 线程
         // TMA warp-group for loading data
         cutlass::arch::warpgroup_reg_dealloc<kNumTMARegisters>(); // 为 TMA 线程组（warp-group）分配预定义的寄存器资源
 
         // NOTES: only one thread (or warp) will be used
-        if (threadIdx.x < kNumMathThreads + 32 and cute::elect_one_sync()) { //  限制 TMA 控制逻辑仅在一个 warp（32 线程）内执行（TMA 操作通常由单个 warp 协调即可）， cute::elect_one_sync() 是同步选举函数，确保最终只有一个线程（或 warp） 执行后续的 TMA 加载逻辑，避免多线程重复发起 TMA 传输
+        if (warp_idx == kNumMathThreads / 32 and cute::elect_one_sync()) { //  限制 TMA 控制逻辑仅在一个 warp（32 线程）内执行（TMA 操作通常由单个 warp 协调即可）， cute::elect_one_sync() 是同步选举函数，确保最终只有一个线程（或 warp） 执行后续的 TMA 加载逻辑，避免多线程重复发起 TMA 传输
             // Persistently schedule over blocks
-            while (scheduler.get_next_block(m_block_idx, n_block_idx)) { // 调度器获取下一个需要处理的矩阵块索引（m_block_idx 对应 M 维度，n_block_idx 对应 N 维度）
-                launch_k_iterations([&](uint32_t k_iter, auto divisible_type, auto _, auto __) {
-                    // 根据 K 维度是否可分（DivisibleK 标签），确定当前迭代需要处理的流水线阶段数（kNumInnerStages）
-                    constexpr bool kHasDivisibleStages = cute::is_same_v<decltype(divisible_type), DivisibleK>;
-                    constexpr uint32_t kNumInnerStages = kHasDivisibleStages ? kNumStages : kNumLastStages;
+            while (scheduler.get_next_block(m_block_idx, n_block_idx)) {
+                // Assign TMA multicast number into A and B
+                // NOTES: there may be additional odd rows/columns or cases where multicast is not possible.
+                const bool is_tma_multicast_valid = scheduler.is_tma_multicast_valid(m_block_idx);
+                const uint32_t num_tma_multicast_a = (kIsTMAMulticastOnA and is_tma_multicast_valid) ? kNumTMAMulticast : 1;
+                const uint32_t num_tma_multicast_b = (not kIsTMAMulticastOnA and is_tma_multicast_valid) ? kNumTMAMulticast : 1;
+                DG_STATIC_ASSERT(kNumTMAMulticast <= 2, "Scheduler does not support > 2 TMA multicast");
 
-                    // Assign TMA multicast number into A and B
-                    // NOTES: there may be additional odd rows/columns or cases where multicast is not possible. 支持多播时用kNumTMAMulticast，否则为 1（单播）
-                    const bool is_tma_multicast_valid = scheduler.is_tma_multicast_valid(m_block_idx);
-                    const uint32_t num_tma_multicast_a = (kIsTMAMulticastOnA and is_tma_multicast_valid) ? kNumTMAMulticast : 1;
-                    const uint32_t num_tma_multicast_b = (not kIsTMAMulticastOnA and is_tma_multicast_valid) ? kNumTMAMulticast : 1;
-                    DG_STATIC_ASSERT(kNumTMAMulticast <= 2, "Scheduler does not support > 2 TMA multicast");
+                for (uint32_t k_block_idx = 0; k_block_idx < num_total_k_blocks; advance_pipeline(k_block_idx)) {
+                    // Wait consumer release
+                    empty_barriers[stage_idx]->wait(phase ^ 1);
 
-                    // NOTES: unrolling and `kNumInnerStages` are vital for performance, NVCC will try to eliminate all
-                    // shared memory pointers, e.g. `full_barriers` registers, if all the access indices are constant
-                    #pragma unroll
-                    for (uint32_t s = 0; s < kNumInnerStages; ++ s) {
-                        // Wait consumer release
-                        empty_barriers[s]->wait((scheduler.current_iter * num_iterations + k_iter + 1) & 1); // 等待共享内存区域空闲（计算线程已消费完数据）
+                    // Issue TMA A
+                    constexpr bool kWithGroupOffsetA = kGemmType == GemmType::MGroupedMasked; // 对于分组 GEMM，不同组的 A 矩阵在全局内存中的存储位置不连续，需要通过 “组偏移量” 定位到当前组的起始地址
+                    auto& full_barrier = *full_barriers[stage_idx];
+                    const uint32_t k_idx = k_block_idx * BLOCK_K; // 计算当前需要加载的 K 维度全局起始索引，精准定位 TMA 要加载的 A/B 矩阵 “K 切片”
+                    tma_copy(&tensor_map_a, reinterpret_cast<uint64_t*>(&full_barrier),
+                             smem_a[stage_idx], k_idx, scheduler.get_global_idx<kWithGroupOffsetA>(shape_m, BLOCK_M, m_block_idx), // k_idx 和scheduler.get_global_idx<kWithGroupOffsetA>(shape_m, BLOCK_M, m_block_idx) 是2D坐标
+                             num_tma_multicast_a); // 加载A矩阵到共享内存smem_a[s] 形状为 BLOCK_M × BLOCK_K 
+                    tma_copy(&tensor_map_sfa, reinterpret_cast<uint64_t*>(&full_barrier),
+                             smem_sfa[stage_idx], m_block_idx * BLOCK_M, scheduler.get_global_idx<kWithGroupOffsetA>(shape_k_scales, 1, k_block_idx),
+                             num_tma_multicast_a); // 加载A的缩放因子sfa到smem_sfa[s]
 
-                        // Issue TMA A
-                        constexpr bool kWithGroupOffsetA = kGemmType == GemmType::MGroupedMasked; // 对于分组 GEMM，不同组的 A 矩阵在全局内存中的存储位置不连续，需要通过 “组偏移量” 定位到当前组的起始地址
-                        auto& full_barrier = *full_barriers[s];
-                        uint32_t k_idx = k_iter * kFullKOfAllStages + s * BLOCK_K; // 计算当前需要加载的 K 维度全局起始索引，精准定位 TMA 要加载的 A/B 矩阵 “K 切片”
-                        tma_copy(&tensor_map_a, reinterpret_cast<uint64_t*>(&full_barrier),
-                                 smem_a[s], k_idx, scheduler.get_global_idx<kWithGroupOffsetA>(shape_m, BLOCK_M, m_block_idx), // k_idx 和scheduler.get_global_idx<kWithGroupOffsetA>(shape_m, BLOCK_M, m_block_idx) 是2D坐标
-                                 num_tma_multicast_a); // 加载A矩阵到共享内存smem_a[s] 形状为 BLOCK_M × BLOCK_K 
-                        tma_copy(&tensor_map_sfa, reinterpret_cast<uint64_t*>(&full_barrier),
-                                 smem_sfa[s], m_block_idx * BLOCK_M,
-                                 scheduler.get_global_idx<kWithGroupOffsetA>(shape_k_scales, 1, k_idx / BLOCK_K),
-                                 num_tma_multicast_a); // 加载A的缩放因子sfa到smem_sfa[s]
-
-                        // Issue TMA B
-                        tma_copy(&tensor_map_b, reinterpret_cast<uint64_t*>(&full_barrier),
-                                 smem_b[s], k_idx, scheduler.get_global_idx<true>(shape_n, BLOCK_N, n_block_idx, m_block_idx),
-                                 num_tma_multicast_b); // 加载B矩阵到共享内存smem_b[s]
-                        full_barrier.arrive_and_expect_tx(SMEM_A_SIZE_PER_STAGE + SMEM_B_SIZE_PER_STAGE + SMEM_SFA_SIZE_PER_STAGE);
-                    }
-
-                    // Wait unaligned cases  对于超出kNumInnerStages的阶段（通常是 K 维度末尾的未对齐部分），无需实际加载数据，只需通过屏障同步标记 “完成”，确保流水线节奏一致
-                    #pragma unroll
-                    for (uint32_t s = kNumInnerStages; s < kNumStages; ++ s) {
-                        empty_barriers[s]->wait((scheduler.current_iter * num_iterations + k_iter + 1) & 1);
-                        full_barriers[s]->arrive();
-                    }
-                }, false, 0);
+                    // Issue TMA B
+                    tma_copy(&tensor_map_b, reinterpret_cast<uint64_t*>(&full_barrier),
+                             smem_b[stage_idx], k_idx, scheduler.get_global_idx<true>(shape_n, BLOCK_N, n_block_idx, m_block_idx),
+                             num_tma_multicast_b);
+                    full_barrier.arrive_and_expect_tx(SMEM_A_SIZE_PER_STAGE + SMEM_B_SIZE_PER_STAGE + SMEM_SFA_SIZE_PER_STAGE);
+                }
             }
 
             // To safely deconstruct distributed shared barriers, we need another round of empty waits
             if constexpr (kNumTMAMulticast > 1) {
-                #pragma unroll
-                for (uint32_t s = 0; s < kNumStages; ++ s)
-                    empty_barriers[s]->wait((scheduler.current_iter * num_iterations + 1) & 1);
+                for (uint32_t i = 0; i < kNumStages; advance_pipeline(i))
+                    empty_barriers[stage_idx]->wait(phase ^ 1);
             }
         }
     } else {
@@ -257,6 +207,11 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
         // NOTES: use `__shfl_sync` to encourage NVCC to use unified registers
         const auto math_wg_idx = __shfl_sync(0xffffffff, threadIdx.x / 128, 0); // 计算当前线程所属的 “计算线程组索引”，并通过线程束洗牌（shuffle）操作让组内所有线程共享该索引
         const auto r_0 = warp_idx * 16 + lane_idx / 4, r_1 = r_0 + 8; // 预计算共享内存访问的偏移量，用于高效加载 A 矩阵的缩放因子（smem_sfa）
+
+        auto a_desc = make_smem_desc(smem_a[0] + math_wg_idx * WGMMA::M * BLOCK_K, 1);
+        auto b_desc = make_smem_desc(smem_b[0], 1);
+        const uint32_t a_desc_lo = __shfl_sync(0xffffffff, a_desc.reg32_[0], 0);
+        const uint32_t b_desc_lo = __shfl_sync(0xffffffff, b_desc.reg32_[0], 0);
 
         // Persistently schedule over blocks
         while (scheduler.get_next_block(m_block_idx, n_block_idx)) {
@@ -279,7 +234,7 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
                 for (uint32_t i = threadIdx.x - 32; i < num_sfb; i += kNumMathThreads - 32) // 让符合条件的线程（threadIdx.x >= 32）按 “跨步访问” 的方式并行加载数据
                     st_shared(smem_sfb + i, __ldg(local_sfb + i));
             }
-            cutlass::arch::NamedBarrier(kNumMathThreads).sync(); // 通过命名屏障（NamedBarrier）同步所有计算线程（共kNumMathThreads个），确保所有sfb数据都已加载到共享内存后，再执行后续的矩阵乘法计算。
+            cutlass::arch::NamedBarrier::sync(kNumMathThreads, 0); // 通过命名屏障（NamedBarrier）同步所有计算线程（共kNumMathThreads个），确保所有sfb数据都已加载到共享内存后，再执行后续的矩阵乘法计算。
 
             // Accumulation for WGMMA or CUDA promotion
             constexpr uint32_t WAVE_BLOCK_M = WGMMA::M * (BLOCK_M <= 64 ? 1 : 2); // 将BLOCK_M划分为更小的 “计算子块”（wave），每个子块由一组线程负责，适配 WGMMA 指令的处理粒度，平衡线程负载
@@ -287,90 +242,96 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
             float accum[WGMMA::kNumAccum], final_accum[WGMMA::kNumAccum * (BLOCK_M / WAVE_BLOCK_M)] = {0}; // accum[WGMMA::kNumAccum]：WGMMA 指令的中间累加器，用于暂存当前子块的乘加结果；final_accum[...]：最终累加结果数组，大小为 “每个子块的累加器数量 × 子块总数”（WGMMA::kNumAccum * (BLOCK_M / WAVE_BLOCK_M)）
 
             // Empty barrier arrival
-            auto empty_barrier_arrive = [&](uint32_t s) { // 定义 发送 “数据已消费” 信号
+            auto empty_barrier_arrive = [&]() { // 定义 发送 “数据已消费” 信号
                 if constexpr (kNumTMAMulticast == 1) {
-                    lane_idx == 0 ? empty_barriers[s]->arrive() : void();
+                    lane_idx == 0 ? empty_barriers[stage_idx]->arrive() : void();
                 } else {
                     auto target_cta = scheduler.is_peer_cta_alive ? lane_idx : cute::block_rank_in_cluster();
-                    lane_idx < kNumTMAMulticast ? empty_barriers[s]->arrive(target_cta) : void();
+                    lane_idx < kNumTMAMulticast ? empty_barriers[stage_idx]->arrive(target_cta) : void();
                 }
             };
 
-            // Launch MMAs
-            launch_k_iterations([&](uint32_t k_iter, auto divisible_type, auto skip_type, auto _) {
-                constexpr bool kSkipComputation = cute::is_same_v<decltype(skip_type), SkipComputation>;
-                constexpr bool kHasDivisibleStages = cute::is_same_v<decltype(divisible_type), DivisibleK>;
-                constexpr uint32_t kNumInnerStages = kSkipComputation ? 0 : (kHasDivisibleStages ? kNumStages : kNumLastStages); // 如果跳过计算，则不进行任何计算，否则根据是否有可整除的阶段（kHasDivisibleStages）来决定是否使用 kNumStages 或 kNumLastStages
+            // Skip useless computations
+            if (scheduler.is_computation_valid(m_block_idx, math_wg_idx * WGMMA::M)) {
+                // The compiler must know the dynamic variable `num_former_iters`'s real value
+                constexpr bool kShouldOptimize = BLOCK_K / constexpr_gcd(BLOCK_K, BLOCK_N) <= 4 and not kMustUseUniformedScaleB;
+                constexpr uint32_t kGap = constexpr_gcd(BLOCK_K, BLOCK_N) / 8;
+                constexpr uint32_t kEnd = kShouldOptimize ? BLOCK_K / 8 : 0;
 
-                #pragma unroll
-                for (uint32_t s = 0; s < kNumInnerStages; ++ s) {
-                    // Read B scales
-                    float scale_b_0 = ld_shared(smem_sfb + k_iter * kNumStages + s), scale_b_1; //  读取 B 矩阵的缩放因子（scale_b_0、scale_b_1）
-                    // NOTES: even some blocks do not need to read the second row, but we still load one to align with other blocks
-                    if constexpr (not kMustUseUniformedScaleB)
-                        scale_b_1 = ld_shared(smem_sfb + k_iter * kNumStages + s + shape_k_scales);
+                // Dispatch `num_former_iters` and launch MMAs
+                dispatch_num_former_iters<0, kGap, kEnd>(kShouldOptimize ? num_former_iters : 0, [&](auto _) {
+                    #pragma unroll 8
+                    for (uint32_t k_block_idx = 0; k_block_idx < num_total_k_blocks; advance_pipeline(k_block_idx)) {
+                        const auto& a_desc_base_lo = a_desc_lo + stage_idx * (SMEM_A_SIZE_PER_STAGE / 16);
+                        const auto& b_desc_base_lo = b_desc_lo + stage_idx * (SMEM_B_SIZE_PER_STAGE / 16);
 
-                    // Wait TMA arrivals 由 TMA 线程在加载完smem_a[s]、smem_b[s]后触发
-                    full_barriers[s]->wait((scheduler.current_iter * num_iterations + k_iter) & 1);
+                        // Read B scales
+                        float scale_b_0 = ld_shared(smem_sfb + k_block_idx), scale_b_1;
+                        // NOTES: even some blocks do not need to read the second row, but we still load one to align with other blocks
+                        if constexpr (not kMustUseUniformedScaleB)
+                            scale_b_1 = ld_shared(smem_sfb + k_block_idx + shape_k_scales);
 
-                    // TODO: remove some useless computation for unaligned Ms
-                    #pragma unroll
-                    for (uint32_t local_idx = 0; local_idx < BLOCK_M / WAVE_BLOCK_M; ++ local_idx) { // 将大的 M 维度块分解为 WGMMA 指令可高效处理的子块，平衡线程负载，提升并行效率
-                      	auto m_offset = local_idx * WAVE_BLOCK_M;
+                        // Wait TMA arrivals 由 TMA 线程在加载完smem_a[s]、smem_b[s]后触发
+                        full_barriers[stage_idx]->wait(phase);
 
-                    	// Read A scales 读取 A 矩阵的缩放因子（scale_a_0、scale_a_1）
-                    	// NOTES: all shared memory read must be prior to `warpgroup_arrive` to avoid next scheduled block polluting the results
-                    	auto scale_a_0 = ld_shared(smem_sfa[s] + r_0 + m_offset);
-                        auto scale_a_1 = ld_shared(smem_sfa[s] + r_1 + m_offset);
+                        // TODO: remove some useless computation for unaligned Ms
+                        #pragma unroll
+                        for (uint32_t local_idx = 0; local_idx < BLOCK_M / WAVE_BLOCK_M; ++ local_idx) { // 将大的 M 维度块分解为 WGMMA 指令可高效处理的子块，平衡线程负载，提升并行效率
+                            auto m_offset = local_idx * WAVE_BLOCK_M;
 
-                    	// Commit WGMMA instructions
-                    	#pragma unroll
-                    	for (uint32_t i = 0; i < WGMMA::kNumAccum; ++ i)
-                            warpgroup_fence_operand(accum[i]); // 确保累加器（accum）的寄存器操作顺序，避免乱序执行导致的数据错误。
-                    	warpgroup_arrive(); // 线程组（warpgroup）内的线程同步，确保所有线程准备好执行矩阵乘法
-                    	#pragma unroll
-                    	for (uint32_t k = 0; k < BLOCK_K / WGMMA::K; ++ k) { // 将 K 维度的子块（BLOCK_K）拆分为 WGMMA 指令可处理的粒度（WGMMA::K)
-                            auto desc_a = make_smem_desc(smem_a[s] + (math_wg_idx * WGMMA::M + m_offset) * BLOCK_K + k * WGMMA::K, 1);
-                            auto desc_b = make_smem_desc(smem_b[s] + k * WGMMA::K, 1);
-                            WGMMA::wgmma(desc_a, desc_b, accum, k);
-                    	}
-                    	warpgroup_commit_batch(); // 提交计算任务
-                    	#pragma unroll
-                    	for (uint32_t i = 0; i < WGMMA::kNumAccum; ++ i)
-                            warpgroup_fence_operand(accum[i]); // // 确保累加器（accum）的寄存器操作顺序，避免乱序执行导致的数据错误。
-                    	warpgroup_wait<0>(); // 等待，确保所有线程的 WGMMA 指令执行完毕
+                            // Read A scales 读取 A 矩阵的缩放因子（scale_a_0、scale_a_1）
+                            // NOTES: all shared memory read must be prior to `warpgroup_arrive` to avoid next scheduled block polluting the results
+                            auto scale_a_0 = ld_shared(smem_sfa[stage_idx] + r_0 + m_offset);
+                            auto scale_a_1 = ld_shared(smem_sfa[stage_idx] + r_1 + m_offset);
 
-                    	// Notify barrier arrival at the last warpgroup wave
-                        if (local_idx == BLOCK_M / WAVE_BLOCK_M - 1)
-                    	    empty_barrier_arrive(s); // 告知 TMA 线程 “当前阶段的共享内存数据已处理完毕，可安全加载新数据”
+                            // Commit WGMMA instructions
+                            #pragma unroll
+                            for (uint32_t i = 0; i < WGMMA::kNumAccum; ++ i)
+                                warpgroup_fence_operand(accum[i]); // 确保累加器（accum）的寄存器操作顺序，避免乱序执行导致的数据错误。
+                            warpgroup_arrive(); // 线程组（warpgroup）内的线程同步，确保所有线程准备好执行矩阵乘法
+                            #pragma unroll
+                            for (uint32_t k = 0; k < BLOCK_K / WGMMA::K; ++ k) { // 将 K 维度的子块（BLOCK_K）拆分为 WGMMA 指令可处理的粒度（WGMMA::K)
+                                a_desc.reg32_[0] = a_desc_base_lo + (m_offset * BLOCK_K + k * WGMMA::K) / 16;
+                                b_desc.reg32_[0] = b_desc_base_lo + k * WGMMA::K / 16;
+                                WGMMA::wgmma(a_desc, b_desc, accum, k);
+                            }
+                            warpgroup_commit_batch(); // 提交计算任务
+                            #pragma unroll
+                            for (uint32_t i = 0; i < WGMMA::kNumAccum; ++ i)
+                                warpgroup_fence_operand(accum[i]); // // 确保累加器（accum）的寄存器操作顺序，避免乱序执行导致的数据错误。
+                            warpgroup_wait<0>(); // 等待，确保所有线程的 WGMMA 指令执行完毕
 
-                    	// Promote with scales 将accum中的中间结果（WGMMA 计算结果）按缩放因子缩放后，累加到final_accum中（final_accum是存储最终结果的累加器数组，按 M 子块划分）
-                    	// NOTES: making it as predicates is very important for performance, comparing to two loops
-                    	float scale_0_0 = scale_a_0 * scale_b_0, scale_1_0 = scale_a_1 * scale_b_0;
-                    	float scale_0_1, scale_1_1;
-                    	if constexpr (not kMustUseUniformedScaleB)
-                            scale_0_1 = scale_a_0 * scale_b_1, scale_1_1 = scale_a_1 * scale_b_1;
+                            // Notify barrier arrival at the last warpgroup wave
+                            if (local_idx == BLOCK_M / WAVE_BLOCK_M - 1)
+                                empty_barrier_arrive(); // 告知 TMA 线程 “当前阶段的共享内存数据已处理完毕，可安全加载新数据”
 
-                        auto shifted_accum = final_accum + WGMMA::kNumAccum * local_idx;
-                    	#pragma unroll
-                    	for (uint32_t i = 0; i < WGMMA::kNumAccum / 4; ++ i) {
-                            // NOTES: for unrolled `num_former_iters` cases, we expect the compiler to automatically make it a constant
-                            bool predicate = kMustUseUniformedScaleB or i < num_former_iters;
-                            shifted_accum[i * 4 + 0] += (predicate ? scale_0_0 : scale_0_1) * accum[i * 4 + 0];
-                            shifted_accum[i * 4 + 1] += (predicate ? scale_0_0 : scale_0_1) * accum[i * 4 + 1];
-                            shifted_accum[i * 4 + 2] += (predicate ? scale_1_0 : scale_1_1) * accum[i * 4 + 2];
-                            shifted_accum[i * 4 + 3] += (predicate ? scale_1_0 : scale_1_1) * accum[i * 4 + 3];
-                    	}
+                            // Promote with scales 将accum中的中间结果（WGMMA 计算结果）按缩放因子缩放后，累加到final_accum中（final_accum是存储最终结果的累加器数组，按 M 子块划分）
+                            // NOTES: making it as predicates is very important for performance, comparing to two loops
+                            float scale_0_0 = scale_a_0 * scale_b_0, scale_1_0 = scale_a_1 * scale_b_0;
+                            float scale_0_1, scale_1_1;
+                            if constexpr (not kMustUseUniformedScaleB)
+                                scale_0_1 = scale_a_0 * scale_b_1, scale_1_1 = scale_a_1 * scale_b_1;
+
+                            auto shifted_accum = final_accum + WGMMA::kNumAccum * local_idx;
+                            #pragma unroll
+                            for (uint32_t i = 0; i < WGMMA::kNumAccum / 4; ++ i) {
+                                // NOTES: for unrolled `num_former_iters` cases, we expect the compiler to automatically make it a constant
+                                bool predicate = kMustUseUniformedScaleB or i < num_former_iters;
+                                shifted_accum[i * 4 + 0] += (predicate ? scale_0_0 : scale_0_1) * accum[i * 4 + 0];
+                                shifted_accum[i * 4 + 1] += (predicate ? scale_0_0 : scale_0_1) * accum[i * 4 + 1];
+                                shifted_accum[i * 4 + 2] += (predicate ? scale_1_0 : scale_1_1) * accum[i * 4 + 2];
+                                shifted_accum[i * 4 + 3] += (predicate ? scale_1_0 : scale_1_1) * accum[i * 4 + 3];
+                            }
+                        }
                     }
-                }
-
-                // Wait unaligned cases
+                });
+            } else {
                 #pragma unroll
-                for (uint32_t s = kNumInnerStages; s < kNumStages; ++ s) {
-                    full_barriers[s]->wait((scheduler.current_iter * num_iterations + k_iter) & 1);
-                    empty_barrier_arrive(s);
+                for (uint32_t k_block_idx = 0; k_block_idx < num_total_k_blocks; advance_pipeline(k_block_idx)) {
+                    full_barriers[stage_idx]->wait(phase);
+                    empty_barrier_arrive();
                 }
-            }, not scheduler.is_computation_valid(m_block_idx, math_wg_idx * WGMMA::M), num_former_iters);
+            }
 
             // TMA checks
             constexpr uint32_t kNumElemBytes = sizeof(nv_bfloat16); // 目标数据类型（nv_bfloat16）的字节大小
@@ -384,7 +345,7 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
             // Wait last TMA store to be finished
             if (threadIdx.x < BLOCK_N / TMA_D_BLOCK_N) 
                 cute::tma_store_wait<0>();
-            cutlass::arch::NamedBarrier(kNumMathThreads).sync(); // 确保所有计算线程（共kNumMathThreads个）都完成前序计算，统一进入结果写入阶段
+            cutlass::arch::NamedBarrier::sync(kNumMathThreads, 0); // 确保所有计算线程（共kNumMathThreads个）都完成前序计算，统一进入结果写入阶段
 
             // Write back to shared memory using STSM and issue TMA stores
             DG_STATIC_ASSERT(WGMMA::kNumAccum % 4 == 0, "Invalid STSM x2 vectorization");
@@ -433,7 +394,7 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
                 }
             }
             cute::tma_store_fence(); // TMA 存储的内存屏障，确保所有 TMA 存储操作完成
-            cutlass::arch::NamedBarrier(kNumMathThreads).sync(); // 确保所有计算线程（共kNumMathThreads个）都完成结果写入，统一进入 TMA 存储阶段
+            cutlass::arch::NamedBarrier::sync(kNumMathThreads, 0); // 确保所有计算线程（共kNumMathThreads个）都完成结果写入，统一进入 TMA 存储阶段
 
             // Use TMA store to write back to global memory
             // TODO: compatible with FP32 output
@@ -443,7 +404,7 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
                 auto in_block_n_offset = threadIdx.x * TMA_D_BLOCK_N; // 当前线程负责的 N 维度在本地块内的偏移
                 auto smem_ptr = smem_d + in_block_n_offset * BLOCK_M; // 共享内存中待存储数据的起始地址
                 cute::SM90_TMA_STORE_2D::copy(&tensor_map_d, smem_ptr,
-                                              n_block_idx * BLOCK_N + in_block_n_offset,
+                                              epilogue_type_t::apply_index_n<TMA_D_BLOCK_N>(n_block_idx * BLOCK_N + in_block_n_offset),
                                               scheduler.get_global_idx<kWithGroupOffsetD>(shape_m, BLOCK_M, m_block_idx)); // 使用 TMA 存储指令（TMA_STORE_2D），将数据从共享内存中存储到全局内存中
                 cute::tma_store_arrive();
             }
