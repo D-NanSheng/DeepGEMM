@@ -97,7 +97,7 @@ static void sm90_fp8_gemm_1d2d(const torch::Tensor& a, const torch::Tensor& sfa,
                                                SM90ArchSpec::get_ab_load_block_m(config.multicast_config, config.block_m),
                                                config.block_k,
                                                static_cast<int>(a.stride(get_non_contiguous_dim(major_a))), 1,
-                                               config.smem_config.swizzle_a_mode);
+                                               config.smem_config.swizzle_a_mode, 0, false, 1);
     const auto& tensor_map_b = make_tma_b_desc(major_b, b, n, k,
                                                SM90ArchSpec::get_ab_load_block_n(config.multicast_config, config.block_n),
                                                config.block_k,

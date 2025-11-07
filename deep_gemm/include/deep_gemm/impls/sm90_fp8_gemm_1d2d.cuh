@@ -166,9 +166,13 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
                     constexpr bool kWithGroupOffsetA = kGemmType == GemmType::MGroupedMasked;
                     auto& full_barrier = *full_barriers[stage_idx];
                     const uint32_t k_idx = k_block_idx * BLOCK_K;
-                    tma_copy(&tensor_map_a, reinterpret_cast<uint64_t*>(&full_barrier),
-                             smem_a[stage_idx], k_idx, scheduler.get_global_idx<kWithGroupOffsetA>(shape_m, BLOCK_M, m_block_idx),
+                    #pragma unroll
+                    for(int i=0; i<1; ++i) {
+                        tma_copy(&tensor_map_a, reinterpret_cast<uint64_t*>(&full_barrier),
+                             smem_a[stage_idx]+i*BLOCK_M/2*BLOCK_K, k_idx, scheduler.get_global_idx<kWithGroupOffsetA>(shape_m, BLOCK_M, m_block_idx)+i*BLOCK_M/2,
                              num_tma_multicast_a);
+                    }
+                    
                     tma_copy(&tensor_map_sfa, reinterpret_cast<uint64_t*>(&full_barrier),
                              smem_sfa[stage_idx], m_block_idx * BLOCK_M, scheduler.get_global_idx<kWithGroupOffsetA>(shape_k_scales, 1, k_block_idx),
                              num_tma_multicast_a);
@@ -259,6 +263,20 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
 
                         // Wait TMA arrivals
                         full_barriers[stage_idx]->wait(phase);
+
+                        // 打印smema的所有数据
+                        if(blockIdx.x ==0 && threadIdx.x == 0) {
+                            printf("smema:\n");
+                            for (uint32_t i = 0; i < BLOCK_M; ++ i) {
+                                for(uint32_t j = 0; j < BLOCK_K; ++ j) {
+                                    float val = static_cast<float>(smem_a[stage_idx][i*BLOCK_K+ j]);
+                                    if(val > 0.0f)
+                                        printf("%.2f ", val);
+                                }
+                                printf("\n");
+                            }
+                        }
+                        
 
                         // TODO: remove some useless computation for unaligned Ms
                         #pragma unroll

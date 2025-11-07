@@ -149,11 +149,12 @@ static CUtensorMap make_tma_a_desc(const cute::UMMA::Major& major,
                                    const int& outer_stride,
                                    const int& num_groups,
                                    const int& swizzle_mode, const int& swizzle_base = 0,
-                                   const bool& allow_tf32 = false) {
+                                   const bool& allow_tf32 = false,
+                                   const int& gps_tma_copy_size = 1) {
     if (num_groups > 1)
         DG_HOST_ASSERT(major == cute::UMMA::Major::K);
     const auto& [gmem_inner_dim, gmem_outer_dim] = get_inner_outer_dims(major, shape_k, shape_m * num_groups);
-    const auto& [smem_inner_dim, smem_outer_dim] = get_inner_outer_dims(major, block_k, block_m);
+    const auto& [smem_inner_dim, smem_outer_dim] = get_inner_outer_dims(major, block_k, block_m / gps_tma_copy_size);
     return make_tma_2d_desc(t,
                             gmem_inner_dim, gmem_outer_dim,
                             smem_inner_dim, smem_outer_dim,

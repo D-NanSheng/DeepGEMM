@@ -225,7 +225,7 @@ static GemmConfig get_best_config(const GemmType& gemm_type, const KernelType& k
         std::swap(order[0], order[1]);
     for (const bool& is_multicast_on_a: order) {
         if (m >= 512 and is_legal[static_cast<int>(is_multicast_on_a)]) {
-            best_multicast_config = {2, is_multicast_on_a};
+            best_multicast_config = {1, is_multicast_on_a};
             break;
         }
     }

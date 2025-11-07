@@ -41,6 +41,28 @@ def test_gemm() -> None:
                                   f'{diff:.5f}, alias={test_alias}')
 
         a, b, c, d, ref_d = generate_normal(m, n, k, major_a, major_b, accumulate, out_dtype, kernel_type, use_ue8m0=use_ue8m0)
+
+        #打印tensor a的所有内容
+        # torch.set_printoptions(threshold=10000, linewidth=200, edgeitems=10, precision=2)
+        # print(a[0].shape)
+        # print(a[0])
+        
+        # 将a[0]按照shape写入文件
+        with open('tensor_a_fp8.txt', 'w') as f:
+            f.write(f"Shape: {a[0].shape}\n")
+            f.write(f"Dtype: {a[0].dtype}\n")
+            f.write(f"Device: {a[0].device}\n\n")
+            
+            # 将张量转换为CPU并转为float以便写入
+            a_cpu = a[0].cpu().float().numpy()
+            
+            # 按照shape写入，每行对应矩阵的一行
+            for i in range(a_cpu.shape[0]):
+                row_str = ' '.join([f'{val:.2f}' for val in a_cpu[i]])
+                f.write(row_str + '\n')
+        
+        print(f"Tensor a[0] saved to tensor_a_fp8.txt")
+
         t = bench_kineto(lambda: deep_gemm.fp8_gemm_nt(a, b, d, c=c, disable_ue8m0_cast=disable_ue8m0_cast, recipe=recipe),
                          'fp8_gemm', suppress_kineto_output=True)
         cublas_t, split_k_t = bench_kineto(lambda: deep_gemm.cublaslt_gemm_nt(a[0], b[0], d, c=c), ('nvjet', 'reduce'), suppress_kineto_output=True)
