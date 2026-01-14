@@ -108,7 +108,8 @@ static SharedMemoryConfig get_smem_config(const GemmType& gemm_type, const Kerne
     const int& load_block_n = ArchSpec::get_ab_load_block_n(multicast_config, block_n);
     const int& swizzle_a_mode = get_swizzle_mode(major_a == cute::UMMA::Major::K ? block_k : load_block_m, ab_elem_size);
     const int& swizzle_b_mode = get_swizzle_mode(major_b == cute::UMMA::Major::K ? block_k : load_block_n, ab_elem_size);
-    const int& swizzle_cd_mode = ArchSpec::enable_cd_swizzle(cd_dtype) ? get_swizzle_mode(block_n, cd_elem_size) : 0;
+    const bool use_2d1d_transpose = (get_env<int>("GPS_USE_TRANSPOSE") == 2 or get_env<int>("GPS_USE_TRANSPOSE") == 4);
+    const int& swizzle_cd_mode = ArchSpec::enable_cd_swizzle(cd_dtype) ? (use_2d1d_transpose ? get_swizzle_mode(block_m, cd_elem_size) : get_swizzle_mode(block_n, cd_elem_size)) : 0;
 
     // Different archs have different epilogue pipelines
     const int& smem_cd = ArchSpec::get_smem_cd_size(kernel_type, block_m, block_n, swizzle_cd_mode, cd_dtype);
@@ -118,10 +119,10 @@ static SharedMemoryConfig get_smem_config(const GemmType& gemm_type, const Kerne
     const int& smem_b_per_stage = load_block_n * block_k * ab_elem_size;
 
     // SF shared memory
+    const bool use_2d1d_xx = get_env<int>("GPS_USE_TRANSPOSE") > 0;
     const auto& [smem_sfa_per_stage, smem_sfb_per_stage] =
-        ArchSpec::get_sf_smem_size_per_stage(kernel_type, block_m, block_n, block_k, ab_dtype, cd_dtype);
-    const int& smem_extra_sfb = ArchSpec::get_extra_sfb_smem_size(m, n, k, block_m, block_n, block_k);
-
+        use_2d1d_xx ? ArchSpec::get_sf_smem_size_per_stage(kernel_type, block_n, block_m, block_k, ab_dtype, cd_dtype) : ArchSpec::get_sf_smem_size_per_stage(kernel_type, block_m, block_n, block_k, ab_dtype, cd_dtype);
+    const int& smem_extra_sfb = use_2d1d_xx ? ArchSpec::get_extra_sfb_smem_size(m, n, k, block_n, block_m, block_k) : ArchSpec::get_extra_sfb_smem_size(m, n, k, block_m, block_n, block_k);
     // M-barriers and tensor memory pointers
     const int& smem_barrier = ArchSpec::get_barrier_smem_size(num_stages);
     const int& smem_tmem_ptr = ArchSpec::get_tmem_ptr_smem_size();
@@ -182,35 +183,41 @@ static GemmConfig get_best_config(const GemmType& gemm_type, const KernelType& k
     // Decide block sizes by waves
     int best_block_m = 0, best_block_n = 0;
     int best_num_waves = 0, best_last_util = 0;
-    for (const auto& block_m: block_ms) {
-        for (const auto& block_n: block_ns) {
-            const int& num_waves = get_num_waves(block_m, block_n);
-            const auto& last_util = get_last_wave_util(block_m, block_n);
-            if (not ArchSpec::is_block_size_legal(kernel_type, major_a, major_b, ab_dtype, cd_dtype, m, n, k, block_m, block_n, block_k))
-                continue;
+    if (get_env<int>("GPS_BLOCK_M") > 0 and get_env<int>("GPS_BLOCK_N") > 0) {
+        best_block_m = get_env<int>("GPS_BLOCK_M"), best_block_n = get_env<int>("GPS_BLOCK_N");
+        best_num_waves = get_num_waves(best_block_m, best_block_n), best_last_util = get_last_wave_util(best_block_m, best_block_n);
+    }
+    else {
+        for (const auto& block_m: block_ms) {
+            for (const auto& block_n: block_ns) {
+                const int& num_waves = get_num_waves(block_m, block_n);
+                const auto& last_util = get_last_wave_util(block_m, block_n);
+                if (not ArchSpec::is_block_size_legal(kernel_type, major_a, major_b, ab_dtype, cd_dtype, m, n, k, block_m, block_n, block_k))
+                    continue;
 
-            bool success = false;
-            if (best_block_m == 0 or best_block_n == 0 or num_waves < best_num_waves) {
-                success = true;
-            } else if (num_waves == best_num_waves) {
-                // Check last wave utilization
-                success = last_util > best_last_util;
-                if (last_util == best_last_util) {
-                    // Case 1: same `block_m`, smaller `block_n` (wasted)
-                    success |= block_m == best_block_m and block_n < best_block_n;
-                    // Case 2: same `block_n`, smaller `block_m` (wasted)
-                    success |= block_n == best_block_n and block_m < best_block_m;
-                    // Case 3: different for both `block_m` and `block_n`, larger `block_n` is better
-                    // NOTES: don't pick `block_m/block_n` larger than shape `m/n` in this case
-                    success |= block_m != best_block_m and block_n > best_block_n 
-                               and block_n <= n and block_m <= m;
+                bool success = false;
+                if (best_block_m == 0 or best_block_n == 0 or num_waves < best_num_waves) {
+                    success = true;
+                } else if (num_waves == best_num_waves) {
+                    // Check last wave utilization
+                    success = last_util > best_last_util;
+                    if (last_util == best_last_util) {
+                        // Case 1: same `block_m`, smaller `block_n` (wasted)
+                        success |= block_m == best_block_m and block_n < best_block_n;
+                        // Case 2: same `block_n`, smaller `block_m` (wasted)
+                        success |= block_n == best_block_n and block_m < best_block_m;
+                        // Case 3: different for both `block_m` and `block_n`, larger `block_n` is better
+                        // NOTES: don't pick `block_m/block_n` larger than shape `m/n` in this case
+                        success |= block_m != best_block_m and block_n > best_block_n 
+                                and block_n <= n and block_m <= m;
+                    }
                 }
-            }
 
-            // Replace with the new config if successful
-            if (success) {
-                best_block_m = block_m, best_block_n = block_n;
-                best_num_waves = num_waves, best_last_util = last_util;
+                // Replace with the new config if successful
+                if (success) {
+                    best_block_m = block_m, best_block_n = block_n;
+                    best_num_waves = num_waves, best_last_util = last_util;
+                }
             }
         }
     }
@@ -236,7 +243,7 @@ static GemmConfig get_best_config(const GemmType& gemm_type, const KernelType& k
     int best_num_stages = 0;
     SharedMemoryConfig best_smem_config;
     for (int num_stages = 32; num_stages > 0; -- num_stages) {
-        if (not ArchSpec::is_num_stages_legal(ab_dtype, cd_dtype, num_stages, best_block_m, best_block_n, block_k))
+        if (not get_env<int>("GPS_IGNORE_STAGES_LIMIT") and not ArchSpec::is_num_stages_legal(ab_dtype, cd_dtype, num_stages, best_block_m, best_block_n, block_k))
             continue;
 
         best_smem_config = get_smem_config<ArchSpec>(gemm_type, kernel_type,
@@ -296,14 +303,14 @@ static GemmConfig get_best_config(const GemmType& gemm_type, const KernelType& k
                    "A major: %d, B major: %d, AB dtype: %s, CD dtype: %s, accumulation: %d, "
                    "SM limit: %d -> block M: %d, block N: %d, block K: %d, stages: %d, last stages: %d, "
                    "SMs: %d, multicast: %d, multicast on A: %d, shared memory: %d bytes, swizzle A: %d, "
-                   "swizzle B: %d, swizzle CD: %d, SMs: %d, threads: %d, TC util: %d%%\n",
+                   "swizzle B: %d, swizzle CD: %d, SMs: %d, threads: %d, waves: %d, TC util: %d%%\n",
                    static_cast<int>(gemm_type), static_cast<int>(kernel_type), m, n, k, num_groups,
                    static_cast<int>(major_a), static_cast<int>(major_b), c10::toString(ab_dtype), c10::toString(cd_dtype),
                    static_cast<int>(with_accumulation), num_sms, best_block_m, best_block_n, block_k,
                    best_num_stages, config.num_last_stages, num_min_sms, best_multicast_config.num_multicast,
                    static_cast<int>(best_multicast_config.is_multicast_on_a),
                    best_smem_config.smem_size, best_smem_config.swizzle_a_mode, best_smem_config.swizzle_b_mode,
-                   best_smem_config.swizzle_cd_mode, config.num_sms, config.thread_config.num_threads, config.tc_util);
+                   best_smem_config.swizzle_cd_mode, config.num_sms, config.thread_config.num_threads, best_num_waves, config.tc_util);
             printed.insert(key);
         }
     }

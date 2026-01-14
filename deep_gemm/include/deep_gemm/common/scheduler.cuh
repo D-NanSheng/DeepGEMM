@@ -33,7 +33,8 @@ template <GemmType kGemmType,
           uint32_t kNumMulticast, bool kIsMulticastOnA,
           uint32_t kNumSMs,
           uint32_t SF_K_ALIGNMENT = 512u,  // for k-grouped GEMM only: 128 (SM90 float SF) or 512 (SM100 UE8M0 SF)
-          uint32_t kNum1DBlocksPerGroup = get_num_1d_blocks_per_group<kGemmType, BLOCK_M, BLOCK_N, kNumSMs, kIsMulticastOnA>()>
+          uint32_t kNum1DBlocksPerGroup = get_num_1d_blocks_per_group<kGemmType, BLOCK_M, BLOCK_N, kNumSMs, kIsMulticastOnA>(),
+          bool kIsNGroupMasked = false> // for GemmType::MGroupedMasked, but is NGroupMasked
 struct Scheduler {
     int current_iter = -1;
 
@@ -50,7 +51,7 @@ struct Scheduler {
     int* grouped_layout;
     uint32_t current_group_idx = 0;
     // Only used for masked layout
-    uint32_t current_m_cumsum = 0;
+    uint32_t current_m_or_n_cumsum = 0;
     // Only used for k-grouped layout
     uint32_t current_shape_k, current_num_valid_groups = 0, current_k_cumsum = 0, current_sf_k_cumsum = 0;
     uint32_t next_group_idx, next_shape_k;
@@ -162,16 +163,28 @@ struct Scheduler {
                     return false;
 
                 // Within current group
-                num_m_blocks = ceil_div(static_cast<uint32_t>(__ldg(grouped_layout + current_group_idx)), BLOCK_M);
-                const auto current_m_block_cumsum = current_m_cumsum + num_m_blocks;
-                if (next_block_idx < current_m_block_cumsum * num_n_blocks)
-                    break;
+                if constexpr (!kIsNGroupMasked) {
+                    num_m_blocks = ceil_div(static_cast<uint32_t>(__ldg(grouped_layout + current_group_idx)), BLOCK_M);
+                    const auto current_m_block_cumsum = current_m_or_n_cumsum + num_m_blocks;
+                    if (next_block_idx < current_m_block_cumsum * num_n_blocks)
+                        break;
 
-                // Move to check the next group
-                current_group_idx ++, current_m_cumsum = current_m_block_cumsum;
+                    // Move to check the next group
+                    current_group_idx ++, current_m_or_n_cumsum = current_m_block_cumsum;
+                }
+                else {
+                    num_n_blocks = ceil_div(static_cast<uint32_t>(__ldg(grouped_layout + current_group_idx)), BLOCK_N);
+                    const auto current_n_block_cumsum = current_m_or_n_cumsum + num_n_blocks;
+                    if (next_block_idx < current_n_block_cumsum * num_m_blocks)
+                        break;
+                    // Move to check the next group
+                    current_group_idx ++, current_m_or_n_cumsum = current_n_block_cumsum;
+                }
+                
             }
 
-            get_swizzled_block_idx(next_block_idx - current_m_cumsum * num_n_blocks, m_block_idx, n_block_idx);
+            if constexpr (!kIsNGroupMasked) get_swizzled_block_idx(next_block_idx - current_m_or_n_cumsum * num_n_blocks, m_block_idx, n_block_idx);
+            else get_swizzled_block_idx(next_block_idx - current_m_or_n_cumsum * num_m_blocks, m_block_idx, n_block_idx);
         } else if constexpr (kGemmType == GemmType::KGroupedContiguous) {
             while (true) {
                 // End of the task
@@ -241,13 +254,14 @@ struct Scheduler {
 
     // For SM90 only
     // ReSharper disable once CppNotAllPathsReturnValue
-    __device__ __forceinline__ bool is_computation_valid(const uint32_t& m_block_idx, const uint32_t& m_offset) const {
+    __device__ __forceinline__ bool is_computation_valid(const uint32_t& m_or_n_block_idx, const uint32_t& m_or_n_offset) const {
         if constexpr (kGemmType == GemmType::Normal or kGemmType == GemmType::Batched) {
             return true;
         } else if constexpr (kGemmType == GemmType::MGroupedContiguous) {
-            return __ldg(grouped_layout + m_offset + m_block_idx * BLOCK_M) >= 0;
+            return __ldg(grouped_layout + m_or_n_offset + m_or_n_block_idx * BLOCK_M) >= 0;
         } else if constexpr (kGemmType == GemmType::MGroupedMasked) {
-            return m_offset + m_block_idx * BLOCK_M < __ldg(grouped_layout + current_group_idx);
+            if constexpr (!kIsNGroupMasked) return m_or_n_offset + m_or_n_block_idx * BLOCK_M < __ldg(grouped_layout + current_group_idx);
+            else return m_or_n_offset + m_or_n_block_idx * BLOCK_N < __ldg(grouped_layout + current_group_idx);
         }
     }
 };

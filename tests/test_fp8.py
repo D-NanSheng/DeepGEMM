@@ -2,6 +2,7 @@ import copy
 import numpy as np
 import random
 import torch
+import os
 
 import deep_gemm
 from deep_gemm.testing import (
@@ -12,8 +13,8 @@ from deep_gemm.testing import (
 
 from generators import (
     KernelType, get_ue8m0_usage,
-    enumerate_normal, enumerate_m_grouped_contiguous, enumerate_m_grouped_masked, enumerate_k_grouped_contiguous,
-    generate_normal, generate_m_grouped_contiguous, generate_m_grouped_masked, generate_k_grouped_contiguous
+    enumerate_normal, enumerate_m_grouped_contiguous, enumerate_m_grouped_masked, enumerate_m_grouped_masked_transpose, enumerate_k_grouped_contiguous, enumerate_m_grouped_masked_transpose_n_group,
+    generate_normal, generate_m_grouped_contiguous, generate_m_grouped_masked, generate_m_grouped_masked_2d1d, generate_m_grouped_masked_2d1d_transpose, generate_k_grouped_contiguous, generate_m_grouped_masked_2d1d_n_group, generate_m_grouped_masked_2d1d_transpose_n_group
 )
 
 
@@ -53,7 +54,10 @@ def test_gemm() -> None:
               f'{(cublas_t + split_k_t) / t:.2f}x cuBLAS')
         if cublas_t > 0:
             scores.append((cublas_t + split_k_t) / t)
-    print(f"Average speedup over cuBLASLt: {float(np.prod(scores)) ** (1.0 / len(scores)):.3f}x\n")
+    if len(scores) > 0:
+        print(f"Average speedup over cuBLASLt: {float(np.prod(scores)) ** (1.0 / len(scores)):.3f}x\n")
+    else:
+        print("No valid scores to compute average speedup.\n")
 
 
 def test_m_grouped_gemm_contiguous() -> None:
@@ -126,6 +130,145 @@ def test_m_grouped_gemm_masked() -> None:
               f'{(count_bytes(a, d) * valid_m / (max_m * num_groups) + count_bytes(b)) / 1e9 / t:4.0f} GB/s')
     print()
 
+def test_m_grouped_gemm_masked_2d1d() -> None:
+    print('Testing m-grouped masked 2d1d GEMM:')
+
+    # TODO: when the actual `m` is greater than `expected_m_per_group`, efficiency may significantly decrease.
+    for kernel_type, num_groups, max_m, expected_m_per_group, n, k in enumerate_m_grouped_masked_transpose(torch.float8_e4m3fn):
+        kernel_opt = f'1D1D' if kernel_type.is_1d1d() else '1D2D'
+        use_ue8m0 = get_ue8m0_usage(kernel_type)
+        disable_ue8m0_cast = not use_ue8m0
+
+        # Test correctness
+        for i in range(10):
+            a, b, masked_m, d, ref_d = generate_m_grouped_masked_2d1d(num_groups, max_m, expected_m_per_group, n, k, use_ue8m0=use_ue8m0)
+            deep_gemm.m_grouped_fp8_gemm_tn_masked(a, b, d, masked_m, expected_m_per_group, disable_ue8m0_cast=disable_ue8m0_cast)
+            for j in range(num_groups):
+                if masked_m[j].item() == 0:
+                    continue
+                diff = calc_diff(d[j, :masked_m[j].item()], ref_d[j, :masked_m[j].item()])
+                assert diff < 0.001, f'{max_m=}, {n=}, {k=}, {j=}, masked_m={masked_m[j]}, {kernel_opt}, {num_groups=}, {diff:.5f}'
+
+        # Construct full cases
+        a, b, masked_m, d, ref_d = generate_m_grouped_masked_2d1d(num_groups, max_m, expected_m_per_group, n, k, use_ue8m0=use_ue8m0)
+
+        # noinspection PyShadowingNames
+        def test_func():
+            deep_gemm.m_grouped_fp8_gemm_tn_masked(a, b, d, masked_m, expected_m_per_group, disable_ue8m0_cast=disable_ue8m0_cast)
+
+        # Test performance with fixed shapes
+        valid_m = masked_m.sum().item()
+        t = bench_kineto(test_func, 'fp8_gemm', suppress_kineto_output=True)
+        print(f' > Perf ({num_groups=}, expected_m_per_group={expected_m_per_group:4}, n={n:4}, k={k:4}, {kernel_opt}): '
+              f'{t * 1e6:4.0f} us | '
+              f'{2 * valid_m * n * k / t / 1e12:4.0f} TFLOPS | '
+              f'{(count_bytes(a, d) * valid_m / (max_m * num_groups) + count_bytes(b)) / 1e9 / t:4.0f} GB/s')
+    print()
+
+def test_m_grouped_gemm_masked_2d1d_transpose() -> None:
+    print('Testing m-grouped masked 2d1d transpose GEMM:')
+
+    # TODO: when the actual `m` is greater than `expected_m_per_group`, efficiency may significantly decrease.
+    for kernel_type, num_groups, max_m, expected_m_per_group, n, k in enumerate_m_grouped_masked_transpose(torch.float8_e4m3fn):
+        kernel_opt = f'1D1D' if kernel_type.is_1d1d() else '1D2D'
+        use_ue8m0 = get_ue8m0_usage(kernel_type)
+        disable_ue8m0_cast = not use_ue8m0
+
+        # Test correctness
+        for i in range(10):
+            a, b, masked_m, d, ref_d = generate_m_grouped_masked_2d1d_transpose(num_groups, max_m, expected_m_per_group, n, k, use_ue8m0=use_ue8m0)
+            deep_gemm.m_grouped_fp8_gemm_tn_transpose_masked(a, b, d, masked_m, expected_m_per_group, disable_ue8m0_cast=disable_ue8m0_cast)
+            for j in range(num_groups):
+                if masked_m[j].item() == 0:
+                    continue
+                diff = calc_diff(d[j, :masked_m[j].item()], ref_d[j, :masked_m[j].item()])
+                assert diff < 0.001, f'{max_m=}, {n=}, {k=}, {j=}, masked_m={masked_m[j]}, {kernel_opt}, {num_groups=}, {diff:.5f}'
+
+        # Construct full cases
+        a, b, masked_m, d, ref_d = generate_m_grouped_masked_2d1d_transpose(num_groups, max_m, expected_m_per_group, n, k, use_ue8m0=use_ue8m0)
+
+        # noinspection PyShadowingNames
+        def test_func():
+            deep_gemm.m_grouped_fp8_gemm_tn_transpose_masked(a, b, d, masked_m, expected_m_per_group, disable_ue8m0_cast=disable_ue8m0_cast)
+
+        # Test performance with fixed shapes
+        valid_m = masked_m.sum().item()
+        t = bench_kineto(test_func, 'fp8_gemm', suppress_kineto_output=True)
+        print(f' > Perf ({num_groups=}, expected_m_per_group={expected_m_per_group:4}, n={n:4}, k={k:4}, {kernel_opt}): '
+              f'{t * 1e6:4.0f} us | '
+              f'{2 * valid_m * n * k / t / 1e12:4.0f} TFLOPS | '
+              f'{(count_bytes(a, d) * valid_m / (max_m * num_groups) + count_bytes(b)) / 1e9 / t:4.0f} GB/s')
+    print()
+
+def test_m_grouped_gemm_masked_2d1d_n_group() -> None:
+    print('Testing m-grouped masked 2d1d n-group GEMM:')
+
+    # TODO: when the actual `m` is greater than `expected_m_per_group`, efficiency may significantly decrease.
+    for kernel_type, num_groups, max_n, m, expected_n_per_group, k in enumerate_m_grouped_masked_transpose_n_group(torch.float8_e4m3fn):
+        kernel_opt = f'1D1D' if kernel_type.is_1d1d() else '1D2D'
+        use_ue8m0 = get_ue8m0_usage(kernel_type)
+        disable_ue8m0_cast = not use_ue8m0
+
+        # Test correctness
+        for i in range(10):
+            a, b, masked_n, d, ref_d = generate_m_grouped_masked_2d1d_n_group(num_groups, max_n, m, expected_n_per_group, k, use_ue8m0=use_ue8m0)
+            deep_gemm.m_grouped_fp8_gemm_tn_n_group_masked(a, b, d, masked_n, expected_n_per_group, disable_ue8m0_cast=disable_ue8m0_cast)
+            for j in range(num_groups):
+                if masked_n[j].item() == 0:
+                    continue
+                diff = calc_diff(d[j, :, :masked_n[j].item()], ref_d[j, :, :masked_n[j].item()])
+                assert diff < 0.001, f'{max_n=}, {m=}, {k=}, {j=}, masked_n={masked_n[j]}, {kernel_opt}, {num_groups=}, {diff:.5f}'
+
+        # Construct full cases
+        a, b, masked_n, d, ref_d = generate_m_grouped_masked_2d1d_n_group(num_groups, max_n, m, expected_n_per_group, k, use_ue8m0=use_ue8m0)
+
+        # noinspection PyShadowingNames
+        def test_func():
+            deep_gemm.m_grouped_fp8_gemm_tn_n_group_masked(a, b, d, masked_n, expected_n_per_group, disable_ue8m0_cast=disable_ue8m0_cast)
+
+        # Test performance with fixed shapes
+        valid_n = masked_n.sum().item()
+        t = bench_kineto(test_func, 'fp8_gemm', suppress_kineto_output=True)
+        print(f' > Perf ({num_groups=}, expected_n_per_group={expected_n_per_group:4}, m={m:4}, k={k:4}, {kernel_opt}): '
+              f'{t * 1e6:4.0f} us | '
+              f'{2 * m * valid_n * k / t / 1e12:4.0f} TFLOPS | '
+              f'{(count_bytes(a, d) * valid_n / (max_n * num_groups) + count_bytes(b)) / 1e9 / t:4.0f} GB/s')
+    print()
+
+def test_m_grouped_gemm_masked_2d1d_transpose_n_group() -> None:
+    print('Testing m-grouped masked 2d1d transpose n-group GEMM:')
+
+    # TODO: when the actual `m` is greater than `expected_m_per_group`, efficiency may significantly decrease.
+    for kernel_type, num_groups, max_n, m, expected_n_per_group, k in enumerate_m_grouped_masked_transpose_n_group(torch.float8_e4m3fn):
+        kernel_opt = f'1D1D' if kernel_type.is_1d1d() else '1D2D'
+        use_ue8m0 = get_ue8m0_usage(kernel_type)
+        disable_ue8m0_cast = not use_ue8m0
+
+        # Test correctness
+        for i in range(10):
+            a, b, masked_n, d, ref_d = generate_m_grouped_masked_2d1d_transpose_n_group(num_groups, max_n, m, expected_n_per_group, k, use_ue8m0=use_ue8m0)
+            deep_gemm.m_grouped_fp8_gemm_tn_transpose_n_group_masked(a, b, d, masked_n, expected_n_per_group, disable_ue8m0_cast=disable_ue8m0_cast)
+            for j in range(num_groups):
+                if masked_n[j].item() == 0:
+                    continue
+                diff = calc_diff(d[j, :masked_n[j].item()], ref_d[j, :masked_n[j].item()])
+                assert diff < 0.001, f'{max_n=}, {m=}, {k=}, {j=}, masked_n={masked_n[j]}, {kernel_opt}, {num_groups=}, {diff:.5f}'
+
+        # Construct full cases
+        a, b, masked_n, d, ref_d = generate_m_grouped_masked_2d1d_transpose_n_group(num_groups, max_n, m, expected_n_per_group, k, use_ue8m0=use_ue8m0)
+
+        # noinspection PyShadowingNames
+        def test_func():
+            deep_gemm.m_grouped_fp8_gemm_tn_transpose_n_group_masked(a, b, d, masked_n, expected_n_per_group, disable_ue8m0_cast=disable_ue8m0_cast)
+
+        # Test performance with fixed shapes
+        valid_n = masked_n.sum().item()
+        t = bench_kineto(test_func, 'fp8_gemm', suppress_kineto_output=True)
+        print(f' > Perf ({num_groups=}, expected_n_per_group={expected_n_per_group:4}, m={m:4}, k={k:4}, {kernel_opt}): '
+              f'{t * 1e6:4.0f} us | '
+              f'{2 * m * valid_n * k / t / 1e12:4.0f} TFLOPS | '
+              f'{(count_bytes(a, d) * valid_n / (max_n * num_groups) + count_bytes(b)) / 1e9 / t:4.0f} GB/s')
+    print()
 
 def test_k_grouped_gemm_contiguous() -> None:
     print('Testing k-grouped contiguous GEMM:')
@@ -168,8 +311,48 @@ if __name__ == '__main__':
 
     print('Library path:')
     print(f' > {deep_gemm.__path__}\n')
-
+    print('Origin DeepGEMM Optimization Config:')
+    os.environ['GPS_BLOCK_M'] = str(0)
+    os.environ['GPS_BLOCK_N'] = str(0)
     test_gemm()
-    test_m_grouped_gemm_contiguous()
+    os.environ['GPS_IGNORE_STAGES_LIMIT'] = str(1)
     test_m_grouped_gemm_masked()
-    test_k_grouped_gemm_contiguous()
+    os.environ['GPS_USE_TRANSPOSE'] = str(1)
+    test_m_grouped_gemm_masked_2d1d()
+    os.environ['GPS_USE_TRANSPOSE'] = str(2)
+    test_m_grouped_gemm_masked_2d1d_transpose()
+    os.environ['GPS_USE_TRANSPOSE'] = str(3)
+    test_m_grouped_gemm_masked_2d1d_n_group()
+    os.environ['GPS_USE_TRANSPOSE'] = str(4)
+    test_m_grouped_gemm_masked_2d1d_transpose_n_group()
+    # print('\n' + '='*50)
+    # print('Testing different BLOCK_M and BLOCK_N configurations:')
+    # # 不能用的配置(64, 152)
+    # blockms = [64, 128, 256]
+    # blockns = [8, 16, 24, 32, 40, 48, 56, 64, 72, 80, 88, 96, 104, 112, 120, 128, 136, 144, 152, 160, 168, 176, 184, 192, 200, 208, 216, 224, 232, 240, 248, 256]
+    # failed_configs = []
+    # for m in blockms:
+    #     for n in blockns:
+    #         os.environ['GPS_BLOCK_M'] = str(m)
+    #         os.environ['GPS_BLOCK_N'] = str(n)
+    #         try:
+    #             test_gemm()
+    #             test_m_grouped_gemm_masked()
+    #         except (RuntimeError, torch.cuda.CudaError) as e:
+    #             # Catch CUDA errors (including kernel asserts) and continue
+    #             print(f' > FAILED config (BLOCK_M={m}, BLOCK_N={n}): {e}')
+    #             failed_configs.append((m, n))
+    #             # Clear CUDA error state
+    #             torch.cuda.synchronize()
+    #             torch.cuda.empty_cache()
+    
+    # print('\n' + '='*50)
+    # print(f'Failed configs ({len(failed_configs)}):')
+    # for m, n in failed_configs:
+    #     print(f'  (BLOCK_M={m}, BLOCK_N={n})')
+    # os.environ['GPS_BLOCK_M'] = str(64)
+    # os.environ['GPS_BLOCK_N'] = str(152)
+    # test_gemm()
+    # test_m_grouped_gemm_masked()
+    # test_m_grouped_gemm_contiguous()
+    # test_k_grouped_gemm_contiguous()
