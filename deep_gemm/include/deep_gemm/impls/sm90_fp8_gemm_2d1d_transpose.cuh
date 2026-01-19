@@ -50,7 +50,7 @@ sm90_fp8_gemm_2d1d_transpose_impl(float* sfa, int* grouped_layout,
 #if (defined(__CUDA_ARCH__) and (__CUDA_ARCH__ >= 900)) or defined(__CLION_IDE__)
     // Scaling checks
     DG_STATIC_ASSERT(BLOCK_K == 128, "Only support per-128-channel FP8 scaling");
-    DG_STATIC_ASSERT((kNumGroups > 1 and shape_n % BLOCK_N == 0) or kNumGroups == 1, "shape_n must be a multiple of BLOCK_N when kNumGroups > 1");
+    DG_STATIC_ASSERT((kNumGroups > 1 and SHAPE_N % BLOCK_N == 0) or kNumGroups == 1, "shape_n must be a multiple of BLOCK_N when kNumGroups > 1");
     DG_STATIC_ASSERT(constexpr_ceil_div(BLOCK_M, BLOCK_K) == 1 or (constexpr_gcd(BLOCK_M, BLOCK_K) == BLOCK_M - BLOCK_K), "Too much A scales in a single block");
     // Types
     using WGMMA = typename FP8MMASelector<BLOCK_N>::type;
