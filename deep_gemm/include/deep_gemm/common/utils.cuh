@@ -158,6 +158,46 @@ __device__ __forceinline__ void prefetch_l1(void *ptr) {
     asm volatile("prefetch.global.L1 [%0];" :: "l"(ptr));
 }
 
+__device__ __forceinline__ uint32_t atomic_add_release_global_32(uint32_t* addr, uint32_t value) {
+    uint32_t ret;  // 返回值：原子操作前的原始值
+    asm volatile (
+        "atom.add.release.gpu.global.u32 %0, [%1], %2;" 
+        : "=r"(ret)                // 输出约束：%0 对应 ret，r=32位寄存器（匹配 uint32_t）
+        : "l"(addr), "r"(value)    // 输入约束：%1=addr（指针，64位），%2=value（32位值)
+    );
+    return ret;
+}
+
+__device__ __forceinline__ uint64_t atomic_add_release_global_64(uint64_t* addr, uint64_t value) {
+    uint64_t ret;  // 返回值：原子操作前的原始值（与输入类型一致，均为 uint64_t）
+    asm volatile (
+        "atom.add.release.gpu.global.u64 %0, [%1], %2;" 
+        : "=l"(ret)                // 输出约束：%0 对应 ret，l=64位寄存器（匹配 uint64_t）
+        : "l"(addr), "l"(value)    // 输入约束：%1=addr（指针，64位），%2=value（64位值)
+    );
+    return ret;
+}
+
+__device__ __forceinline__ uint32_t ld_acquire_global_32(const uint32_t* addr) {
+    uint32_t val;
+    asm volatile (
+        "ld.acquire.gpu.global.u32 %0, [%1];"  // 匹配.global内存、u32类型、acquire语义
+        : "=r"(val)                              // 输出：32位寄存器（匹配uint32_t）
+        : "l"(addr)                               // 输入：目标地址（64位指针，用l约束）
+    );
+    return val;
+}
+
+__device__ __forceinline__ uint64_t ld_acquire_global_64(const uint64_t* addr) {
+    uint64_t val;
+    asm volatile (
+        "ld.acquire.gpu.global.u64 %0, [%1];"  // 匹配.global内存、u64类型、acquire语义
+        : "=l"(val)                              // 输出：64位寄存器（匹配uint64_t）
+        : "l"(addr)                               // 输入：目标地址（64位指针，用l约束）
+    );
+    return val;
+}
+
 template <uint32_t kNumBytes>
 struct Vectorized {
     static auto zeros() {

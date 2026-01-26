@@ -270,6 +270,47 @@ def test_m_grouped_gemm_masked_2d1d_transpose_n_group() -> None:
               f'{(count_bytes(a, d) * valid_n / (max_n * num_groups) + count_bytes(b)) / 1e9 / t:4.0f} GB/s')
     print()
 
+def test_m_grouped_gemm_masked_2d1d_transpose_n_group_sbo() -> None:
+    print('Testing m-grouped masked 2d1d transpose n-group SBO GEMM:')
+
+    # TODO: when the actual `m` is greater than `expected_m_per_group`, efficiency may significantly decrease.
+    for kernel_type, num_groups, max_n, m, expected_n_per_group, k in enumerate_m_grouped_masked_transpose_n_group(torch.float8_e4m3fn):
+        kernel_opt = f'1D1D' if kernel_type.is_1d1d() else '1D2D'
+        use_ue8m0 = get_ue8m0_usage(kernel_type)
+        disable_ue8m0_cast = not use_ue8m0
+        
+        # Test correctness
+        for i in range(10):
+            recv_signal = torch.ones(num_groups, device='cuda', dtype=torch.int32) # indicate i-th expert has fully received data
+            send_signal = torch.zeros(num_groups*((max_n+15)//16), device='cuda', dtype=torch.int32) # indicate j-th Block_M Tokens of i-th expert has computed
+            a, b, masked_n, d, ref_d = generate_m_grouped_masked_2d1d_transpose_n_group(num_groups, max_n, m, expected_n_per_group, k, use_ue8m0=use_ue8m0)
+            deep_gemm.m_grouped_fp8_gemm_tn_transpose_n_group_sbo_masked(a, b, d, masked_n, expected_n_per_group, disable_ue8m0_cast=disable_ue8m0_cast, recv_signal=recv_signal.data_ptr(), send_signal=send_signal.data_ptr())
+            for j in range(num_groups):
+                if masked_n[j].item() == 0:
+                    continue
+                diff = calc_diff(d[j, :masked_n[j].item()], ref_d[j, :masked_n[j].item()])
+                assert diff < 0.001, f'{max_n=}, {m=}, {k=}, {j=}, masked_n={masked_n[j]}, {kernel_opt}, {num_groups=}, {diff:.5f}'
+
+        # Construct full cases
+        recv_signal = torch.ones(num_groups, device='cuda', dtype=torch.int32) # indicate i-th expert has fully received data
+        send_signal = torch.zeros(num_groups*((max_n+15)//16), device='cuda', dtype=torch.int32) # indicate j-th Block_M Tokens of i-th expert has computed
+        a, b, masked_n, d, ref_d = generate_m_grouped_masked_2d1d_transpose_n_group(num_groups, max_n, m, expected_n_per_group, k, use_ue8m0=use_ue8m0)
+
+        # noinspection PyShadowingNames
+        def test_func():
+            deep_gemm.m_grouped_fp8_gemm_tn_transpose_n_group_sbo_masked(a, b, d, masked_n, expected_n_per_group, disable_ue8m0_cast=disable_ue8m0_cast, recv_signal=recv_signal.data_ptr(), send_signal=send_signal.data_ptr())
+
+        # Test performance with fixed shapes
+        valid_n = masked_n.sum().item()
+        t = bench_kineto(test_func, 'fp8_gemm', suppress_kineto_output=True)
+        print(f' > Perf ({num_groups=}, expected_n_per_group={expected_n_per_group:4}, m={m:4}, k={k:4}, {kernel_opt}): '
+              f'{t * 1e6:4.0f} us | '
+              f'{2 * m * valid_n * k / t / 1e12:4.0f} TFLOPS | '
+              f'{(count_bytes(a, d) * valid_n / (max_n * num_groups) + count_bytes(b)) / 1e9 / t:4.0f} GB/s')
+        print(f'recv_signal non-zero: {recv_signal[recv_signal != 0]}')
+        print(f'send_signal non-zero: {send_signal[send_signal != 0]}')
+    print()
+
 def test_k_grouped_gemm_contiguous() -> None:
     print('Testing k-grouped contiguous GEMM:')
 
@@ -314,17 +355,14 @@ if __name__ == '__main__':
     print('Origin DeepGEMM Optimization Config:')
     os.environ['GPS_BLOCK_M'] = str(0)
     os.environ['GPS_BLOCK_N'] = str(0)
-    test_gemm()
-    os.environ['GPS_IGNORE_STAGES_LIMIT'] = str(1)
-    test_m_grouped_gemm_masked()
-    os.environ['GPS_USE_TRANSPOSE'] = str(1)
-    test_m_grouped_gemm_masked_2d1d()
-    os.environ['GPS_USE_TRANSPOSE'] = str(2)
-    test_m_grouped_gemm_masked_2d1d_transpose()
-    os.environ['GPS_USE_TRANSPOSE'] = str(3)
-    test_m_grouped_gemm_masked_2d1d_n_group()
-    os.environ['GPS_USE_TRANSPOSE'] = str(4)
+    # test_gemm()
+    # os.environ['GPS_IGNORE_STAGES_LIMIT'] = str(1)
+    # test_m_grouped_gemm_masked()
+    # test_m_grouped_gemm_masked_2d1d()
+    # test_m_grouped_gemm_masked_2d1d_transpose()
+    # test_m_grouped_gemm_masked_2d1d_n_group()
     test_m_grouped_gemm_masked_2d1d_transpose_n_group()
+    test_m_grouped_gemm_masked_2d1d_transpose_n_group_sbo()
     # print('\n' + '='*50)
     # print('Testing different BLOCK_M and BLOCK_N configurations:')
     # # 不能用的配置(64, 152)

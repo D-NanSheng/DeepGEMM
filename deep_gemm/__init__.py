@@ -43,6 +43,7 @@ if version.parse(cuda_version) >= version.parse('12.1'):
         m_grouped_fp8_gemm_tn_transpose_masked,
         m_grouped_fp8_gemm_tn_n_group_masked,
         m_grouped_fp8_gemm_tn_transpose_n_group_masked,
+        m_grouped_fp8_gemm_tn_transpose_n_group_sbo_masked,
         k_grouped_fp8_gemm_nt_contiguous,
         k_grouped_fp8_gemm_tn_contiguous,
         # BF16 GEMMs

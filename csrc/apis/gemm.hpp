@@ -439,6 +439,59 @@ static void m_grouped_fp8_gemm_tn_transpose_n_group_masked(const std::pair<torch
     }
 }
 
+static void m_grouped_fp8_gemm_tn_transpose_n_group_sbo_masked(const std::pair<torch::Tensor, torch::Tensor>& a,
+                                         const std::pair<torch::Tensor, torch::Tensor>& b,
+                                         const torch::Tensor& d,
+                                         const torch::Tensor& masked_n,
+                                         const int& expected_n,
+                                         std::optional<std::tuple<int, int, int>> recipe,
+                                         const std::string& compiled_dims,
+                                         const bool& disable_ue8m0_cast,
+                                         std::optional<uintptr_t> recv_signal_ptr,
+                                         std::optional<uintptr_t> send_signal_ptr) {
+    // Shape must be `[G, M, K] @ [G, N, K].mT`
+    const auto& major_a = get_major_type_ab(a.first);
+    const auto& major_b = get_major_type_ab(b.first);
+    DG_HOST_ASSERT(major_a == cute::UMMA::Major::K and major_b == cute::UMMA::Major::K);
+    DG_HOST_ASSERT(masked_n.is_contiguous());
+
+    // Type and shape checks
+    const auto& [num_groups, m, k] = get_shape<3>(a.first);
+    const auto& [num_groups_, n, k_] = get_shape<3>(b.first);
+    const auto& [num_groups__, n_, m_] = get_shape<3>(d);// 注意这里输出是转置的
+    const auto& num_groups___ = static_cast<int>(masked_n.numel());
+    DG_HOST_ASSERT(num_groups == num_groups_ and num_groups == num_groups__ and num_groups == num_groups___);
+    DG_HOST_ASSERT(m == m_ and n == n_ and k == k_);
+    DG_HOST_ASSERT(expected_n > 0 and m > 0 and n > 0 and k > 0 and num_groups > 0);
+    DG_HOST_ASSERT(a.first.scalar_type() == torch::kFloat8_e4m3fn);
+    DG_HOST_ASSERT(b.first.scalar_type() == torch::kFloat8_e4m3fn);
+    DG_HOST_ASSERT(d.scalar_type() == torch::kBFloat16);
+    DG_HOST_ASSERT(masked_n.scalar_type() == torch::kInt);
+
+    // D must be N-major
+    check_major_type_cd(d);
+
+    // Transform scaling factors
+    if (not recipe.has_value())
+        recipe = get_default_recipe(a.second.scalar_type(), b.second.scalar_type()); // <1, 128, 128>
+    const auto& sfa = layout::transform_sf_into_required_layout(a.second, m, k, recipe.value(), num_groups,  false, disable_ue8m0_cast); // <128, 128>
+    const auto& sfb = layout::transform_sf_into_required_layout(b.second, n, k, recipe.value(), num_groups,  true, disable_ue8m0_cast); // scale 是 <1, 128>
+
+    // Convert uintptr_t to pointer types
+    const uint32_t* recv_signal = recv_signal_ptr.has_value() ? reinterpret_cast<const uint32_t*>(recv_signal_ptr.value()) : nullptr;
+    uint32_t* send_signal = send_signal_ptr.has_value() ? reinterpret_cast<uint32_t*>(send_signal_ptr.value()) : nullptr;
+
+    // Dispatch implementation
+    const auto& arch_major = device_runtime->get_arch_major();
+    if (arch_major == 9 and sfa.scalar_type() == torch::kFloat) {
+        const auto& major_sfa = get_major_type_ab(sfa);
+        sm90_m_grouped_fp8_gemm_masked_2d1d_transpose_n_group_sbo(a.first, sfa, b.first, sfb, d, masked_n,
+                                            num_groups, m, n, k, expected_n, major_a, major_b, major_sfa, compiled_dims, recv_signal, send_signal);
+    } else {
+        DG_HOST_UNREACHABLE("Unsupported architecture or scaling factor types");
+    }
+}
+
 static void k_grouped_fp8_gemm_tn_contiguous(const std::pair<torch::Tensor, torch::Tensor>& a,
                                              const std::pair<torch::Tensor, torch::Tensor>& b,
                                              const torch::Tensor& d,
@@ -802,6 +855,11 @@ static void register_apis(pybind11::module_& m) {
           py::arg("a"), py::arg("b"), py::arg("d"), py::arg("masked_n"),
           py::arg("expected_n"), py::arg("recipe") = std::nullopt,
           py::arg("compiled_dims") = "nk", py::arg("disable_ue8m0_cast") = false);
+    m.def("m_grouped_fp8_gemm_tn_transpose_n_group_sbo_masked", &m_grouped_fp8_gemm_tn_transpose_n_group_sbo_masked,
+          py::arg("a"), py::arg("b"), py::arg("d"), py::arg("masked_n"),
+          py::arg("expected_n"), py::arg("recipe") = std::nullopt,
+          py::arg("compiled_dims") = "nk", py::arg("disable_ue8m0_cast") = false,
+          py::arg("recv_signal") = std::nullopt, py::arg("send_signal") = std::nullopt);
     m.def("k_grouped_fp8_gemm_tn_contiguous", &k_grouped_fp8_gemm_tn_contiguous,
           py::arg("a"), py::arg("b"), py::arg("d"), py::arg("ks"),
           py::arg("ks_tensor"), py::arg("c") = std::nullopt,
