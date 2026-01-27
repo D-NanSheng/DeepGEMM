@@ -30,17 +30,7 @@ __device__ void dispatch_num_former_iters(uint32_t num_former_iters, const func_
         dispatch_num_former_iters<kNumFormerIters + kGap, kGap, kEnd>(num_former_iters, func);
 }
 
-// Signal mode for kernel behavior:
-// 0: No signal - pure matrix multiplication
-// 1: Read signal only (recv_signal) - wait for data ready before computation
-// 2: Write signal only (send_signal) - notify after computation complete
-// 3: Read and Write signal (recv_signal + send_signal) - full synchronization
-template <uint32_t kSignalMode>
-struct SignalModeTraits {
-    static constexpr bool kEnableRecvSignal = (kSignalMode & 1) != 0;  // bit 0: recv signal
-    static constexpr bool kEnableSendSignal = (kSignalMode & 2) != 0;  // bit 1: send signal
-    static_assert(kSignalMode <= 3, "Invalid signal mode: must be 0, 1, 2, or 3");
-};
+
 
 template <uint32_t kSignalMode,
           cute::UMMA::Major kMajorSFA,
@@ -153,8 +143,8 @@ sm90_fp8_gemm_2d1d_transpose_n_group_sbo_impl(float* sfa, int* grouped_layout,
     auto scheduler = Scheduler<kGemmType, BLOCK_M, BLOCK_N, kNumGroups, kNumTMAMulticast, kIsTMAMulticastOnA, kNumSMs,
                                512u,  // SF_K_ALIGNMENT (default)
                                get_num_1d_blocks_per_group<kGemmType, BLOCK_M, BLOCK_N, kNumSMs, kIsTMAMulticastOnA>(),  // kNum1DBlocksPerGroup (default)
-                               true   // kIsNGroupMasked = true
-                               >(shape_m, shape_n, shape_k, grouped_layout);
+                               true,   // kIsNGroupMasked = true
+                               kSignalMode>(shape_m, shape_n, shape_k, grouped_layout);
 
     // Pipeline and TMA phases
     uint32_t stage_idx = 0, phase = 0;
@@ -165,7 +155,7 @@ sm90_fp8_gemm_2d1d_transpose_n_group_sbo_impl(float* sfa, int* grouped_layout,
         stage_idx = stage_idx == kNumStages - 1 ? 0 : stage_idx + 1;
         phase ^= stage_idx == 0;
     };
-    bool expert_data_ready[kNumGroups] = {false};
+    
     if (warp_idx >= kNumMathThreads / 32) {
         // TMA warp-group for loading data
         cutlass::arch::warpgroup_reg_dealloc<kNumTMARegisters>();
@@ -174,20 +164,13 @@ sm90_fp8_gemm_2d1d_transpose_n_group_sbo_impl(float* sfa, int* grouped_layout,
         // We use the third warp, as warp 0/1 may be doing WGMMA with `BLOCK_M == 32`
         if (warp_idx == kNumMathThreads / 32 + 2 and cute::elect_one_sync()) {
             // Persistently schedule over blocks
-            while (scheduler.get_next_block(m_block_idx, n_block_idx)) {
+            while (scheduler.get_next_block(m_block_idx, n_block_idx, recv_signal)) {
                 // Assign TMA multicast number into A and B
                 // NOTES: there may be additional odd rows/columns or cases where multicast is not possible.
                 const bool is_tma_multicast_valid = scheduler.is_tma_multicast_valid(m_block_idx);
                 const uint32_t num_tma_multicast_a = (kIsTMAMulticastOnA and is_tma_multicast_valid) ? kNumTMAMulticast : 1;
                 const uint32_t num_tma_multicast_b = (not kIsTMAMulticastOnA and is_tma_multicast_valid) ? kNumTMAMulticast : 1;
                 DG_STATIC_ASSERT(kNumTMAMulticast <= 2, "Scheduler does not support > 2 TMA multicast");
-                // Wait for recv signal if enabled (compile-time decision)
-                if constexpr (SignalModeTraits<kSignalMode>::kEnableRecvSignal) {
-                    if(!expert_data_ready[scheduler.current_group_idx]) {
-                        while(ld_acquire_global_32(recv_signal + scheduler.current_group_idx) == 0){}
-                    } // 等一个token block 全部收集完成再开始
-                    expert_data_ready[scheduler.current_group_idx] = true;
-                }
                 for (uint32_t k_block_idx = 0; k_block_idx < num_total_k_blocks; advance_pipeline(k_block_idx)) {
                     // Wait consumer release
                     empty_barriers[stage_idx]->wait(phase ^ 1);
@@ -242,7 +225,7 @@ sm90_fp8_gemm_2d1d_transpose_n_group_sbo_impl(float* sfa, int* grouped_layout,
         DG_STATIC_ASSERT(TMA_D_BLOCK_M % 8 == 0, "Invalid TMA block N");
 
         // Persistently schedule over blocks
-        while (scheduler.get_next_block(m_block_idx, n_block_idx)) {
+        while (scheduler.get_next_block(m_block_idx, n_block_idx, recv_signal)) {
             // Decide the number of scales A to load
             DG_TRAP_ONLY_DEVICE_ASSERT(shape_m % 8 == 0); // 在设备端（GPU）断言 N 维度的总大小（shape_n）必须是 8 的倍数，这个断言与Bscale无关？
             uint32_t num_former_iters = BLOCK_M / 8, num_full_iters = num_former_iters; // BLOCK_N是每个线程块（CTA）负责的 N 维度大小（例如 256）， 除以 8 的原因：后续处理 B 矩阵时，通常以 8 个元素为一组（如 WGMMA 指令一次处理 8 列）

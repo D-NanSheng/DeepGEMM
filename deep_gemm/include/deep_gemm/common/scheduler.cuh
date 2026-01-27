@@ -25,6 +25,18 @@ static constexpr uint32_t get_num_1d_blocks_per_group() {
     return num_best_blocks;
 }
 
+// Signal mode for kernel behavior:
+// 0: No signal - pure matrix multiplication
+// 1: Read signal only (recv_signal) - wait for data ready before computation
+// 2: Write signal only (send_signal) - notify after computation complete
+// 3: Read and Write signal (recv_signal + send_signal) - full synchronization
+template <uint32_t kSignalMode>
+struct SignalModeTraits {
+    static constexpr bool kEnableRecvSignal = (kSignalMode & 1) != 0;  // bit 0: recv signal
+    static constexpr bool kEnableSendSignal = (kSignalMode & 2) != 0;  // bit 1: send signal
+    static_assert(kSignalMode <= 3, "Invalid signal mode: must be 0, 1, 2, or 3");
+};
+
 #pragma clang diagnostic push
 #pragma ide diagnostic ignored "cppcoreguidelines-pro-type-member-init"
 template <GemmType kGemmType,
@@ -34,7 +46,8 @@ template <GemmType kGemmType,
           uint32_t kNumSMs,
           uint32_t SF_K_ALIGNMENT = 512u,  // for k-grouped GEMM only: 128 (SM90 float SF) or 512 (SM100 UE8M0 SF)
           uint32_t kNum1DBlocksPerGroup = get_num_1d_blocks_per_group<kGemmType, BLOCK_M, BLOCK_N, kNumSMs, kIsMulticastOnA>(),
-          bool kIsNGroupMasked = false> // for GemmType::MGroupedMasked, but is NGroupMasked
+          bool kIsNGroupMasked = false,
+          uint32_t kSignalMode = 0> // for GemmType::MGroupedMasked, but is NGroupMasked
 struct Scheduler {
     int current_iter = -1;
 
@@ -55,6 +68,8 @@ struct Scheduler {
     // Only used for k-grouped layout
     uint32_t current_shape_k, current_num_valid_groups = 0, current_k_cumsum = 0, current_sf_k_cumsum = 0;
     uint32_t next_group_idx, next_shape_k;
+
+    bool expert_data_ready[kNumGroups] = {false};
 
     // Only used for k-grouped gemm
     __device__ __forceinline__ void get_next_k_group(uint32_t &group_idx, uint32_t &shape_k) const {
@@ -153,7 +168,7 @@ struct Scheduler {
         }
     }
 
-    __device__ __forceinline__ bool get_next_block(uint32_t& m_block_idx, uint32_t& n_block_idx) {
+    __device__ __forceinline__ bool get_next_block(uint32_t& m_block_idx, uint32_t& n_block_idx, const uint32_t* recv_signal = nullptr) {
         const auto next_block_idx = (++ current_iter) * kNumSMs + blockIdx.x;
 
         if constexpr (kGemmType == GemmType::MGroupedMasked) {
@@ -161,7 +176,13 @@ struct Scheduler {
                 // End of the task
                 if (current_group_idx == kNumGroups)
                     return false;
-
+                // Wait for recv signal if enabled (compile-time decision)
+                if constexpr (SignalModeTraits<kSignalMode>::kEnableRecvSignal) {
+                    if(!expert_data_ready[current_group_idx]) {
+                        while(ld_acquire_global_32(recv_signal + current_group_idx) == 0){}
+                        expert_data_ready[current_group_idx] = true;
+                    } // 等一个token block 全部收集完成再开始
+                }
                 // Within current group
                 if constexpr (!kIsNGroupMasked) {
                     num_m_blocks = ceil_div(static_cast<uint32_t>(__ldg(grouped_layout + current_group_idx)), BLOCK_M);
@@ -182,7 +203,13 @@ struct Scheduler {
                 }
                 
             }
-
+            // Wait for recv signal if enabled (compile-time decision)
+            if constexpr (SignalModeTraits<kSignalMode>::kEnableRecvSignal) {
+                if(!expert_data_ready[current_group_idx]) {
+                    while(ld_acquire_global_32(recv_signal + current_group_idx) == 0){}
+                    expert_data_ready[current_group_idx] = true;
+                } // 等一个token block 全部收集完成再开始
+            }
             if constexpr (!kIsNGroupMasked) get_swizzled_block_idx(next_block_idx - current_m_or_n_cumsum * num_n_blocks, m_block_idx, n_block_idx);
             else get_swizzled_block_idx(next_block_idx - current_m_or_n_cumsum * num_m_blocks, m_block_idx, n_block_idx);
         } else if constexpr (kGemmType == GemmType::KGroupedContiguous) {

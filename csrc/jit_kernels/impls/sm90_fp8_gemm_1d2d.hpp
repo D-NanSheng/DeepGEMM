@@ -136,20 +136,21 @@ static void __instantiate_kernel() {{
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
         // TODO: optimize `args` copy
-        if (args.recv_signal == nullptr) {
-            DG_CUDA_UNIFIED_CHECK(launch_kernel(kernel, config,
-                args.sfb, args.grouped_layout,
-                args.m, args.n, args.k,
-                args.tensor_map_a, args.tensor_map_b,
-                args.tensor_map_d, args.tensor_map_sfa));
-        }
-        else {
+        // mode=8 (transpose_n_group_sbo) kernel always requires signal parameters in its signature
+        if (args.transpose_mode == 8) {
             DG_CUDA_UNIFIED_CHECK(launch_kernel(kernel, config,
                 args.sfb, args.grouped_layout,
                 args.m, args.n, args.k,
                 args.tensor_map_a, args.tensor_map_b,
                 args.tensor_map_d, args.tensor_map_sfa,
                 args.recv_signal, args.send_signal));
+        }
+        else {
+            DG_CUDA_UNIFIED_CHECK(launch_kernel(kernel, config,
+                args.sfb, args.grouped_layout,
+                args.m, args.n, args.k,
+                args.tensor_map_a, args.tensor_map_b,
+                args.tensor_map_d, args.tensor_map_sfa));
         }
     }
 };
