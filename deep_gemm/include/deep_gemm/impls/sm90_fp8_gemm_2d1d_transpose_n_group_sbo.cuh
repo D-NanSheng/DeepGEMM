@@ -420,12 +420,12 @@ sm90_fp8_gemm_2d1d_transpose_n_group_sbo_impl(float* sfa, int* grouped_layout,
             cute::tma_store_fence(); // TMA 存储的内存屏障，确保所有 TMA 存储操作完成
             cutlass::arch::NamedBarrier::sync(kNumWGMMAStoreThreads, 1); // 确保所有计算线程（共kNumMathThreads个）都完成结果写入，统一进入 TMA 存储阶段
             // Send signal if enabled (compile-time decision)
-            if constexpr (SignalModeTraits<kSignalMode>::kEnableSendSignal) {
-                // put atomic add operation here, and it can overlap with sfb loading like TMA_STORE_2D
-                if (threadIdx.x == 0) {
-                    atomic_add_release_global_32(send_signal + scheduler.current_group_idx * num_block_tokens + n_block_idx, 1); // x=signal[i], and (x-1)-th Block of i-th Block Tokens is stored
-                }
-            }
+            // if constexpr (SignalModeTraits<kSignalMode>::kEnableSendSignal) {
+            //     // put atomic add operation here, and it can overlap with sfb loading like TMA_STORE_2D
+            //     if (threadIdx.x == 0) {
+            //         atomic_add_release_global_32(send_signal + scheduler.current_group_idx * num_block_tokens + n_block_idx, 1); // x=signal[i], and (x-1)-th Block of i-th Block Tokens is stored
+            //     }
+            // }
             // Use TMA store to write back to global memory
             // TODO: compatible with FP32 output
             // 转置后：tensor_map_d 的 gmem_inner_dim = M, gmem_outer_dim = N
@@ -444,16 +444,15 @@ sm90_fp8_gemm_2d1d_transpose_n_group_sbo_impl(float* sfa, int* grouped_layout,
             }
             __syncwarp();
 
-            
-            // if (threadIdx.x < BLOCK_M / TMA_D_BLOCK_M) {
-            //     asm volatile("cp.async.bulk.wait_group 0;\n" ::: "memory");
-            // }
-
-            // cutlass::arch::NamedBarrier(kNumMathThreads).sync();
-
-            // if (threadIdx.x == 0) {
-            //     atomic_add_release_global_64(send_signal + scheduler.current_group_idx * num_block_tokens + n_block_idx, 1);
-            // }
+            if constexpr (SignalModeTraits<kSignalMode>::kEnableSendSignal) {
+                if (threadIdx.x < BLOCK_M / TMA_D_BLOCK_M) {
+                    asm volatile("cp.async.bulk.wait_group 0;\n" ::: "memory");
+                }
+                cutlass::arch::NamedBarrier(kNumMathThreads).sync();
+                if (threadIdx.x == 0) {
+                    atomic_add_release_global_32(send_signal + scheduler.current_group_idx * num_block_tokens + n_block_idx, 1); 
+                }
+            }
             
         }
 
