@@ -20,7 +20,7 @@ public:
     struct Args {
         cute::UMMA::Major major_sfb;
         int m, n, k, num_groups;
-        int transpose_mode;  // 0: 1d2d, 1: 2d1d, 2: 2d1d_transpose, 3: 2d1d_n_group, 4: 2d1d_transpose_n_group, 8: 2d1d_transpose_n_group_sbo
+        int transpose_mode;  // 0: 1d2d, 1: 2d1d, 2: 2d1d_transpose, 3: 2d1d_n_group, 4: 2d1d_transpose_n_group, 5: 1d2d_sbo, 8: 2d1d_transpose_n_group_sbo
         int signal_mode;     // 0: no signal, 1: recv only, 2: send only, 3: recv+send (only for mode=8)
         const std::string& compiled_dims;
         const std::optional<std::string>& epilogue_type;
@@ -58,43 +58,14 @@ public:
                 include_file = "deep_gemm/impls/sm90_fp8_gemm_2d1d_transpose_n_group.cuh";
                 kernel_name = "sm90_fp8_gemm_2d1d_transpose_n_group_impl";
                 break;
+            case 5:
+                include_file = "deep_gemm/impls/sm90_fp8_gemm_1d2d_sbo.cuh";
+                kernel_name = "sm90_fp8_gemm_1d2d_sbo_impl";
+                break;
             case 8:
                 include_file = "deep_gemm/impls/sm90_fp8_gemm_2d1d_transpose_n_group_sbo.cuh";
                 kernel_name = "sm90_fp8_gemm_2d1d_transpose_n_group_sbo_impl";
-                // For mode=8, generate with kSignalMode template parameter
-                return fmt::format(R"(
-#include <{}>
-
-using namespace deep_gemm;
-
-static void __instantiate_kernel() {{
-    auto ptr = reinterpret_cast<void*>(&{}<
-        {},
-        {},
-        {}, {}, {},
-        {},
-        {}, {}, {},
-        {}, {}, {},
-        {}, {},
-        {}, {},
-        {}, {},
-        {}, {},
-        {}
-    >);
-}};
-)",
-                    include_file, kernel_name,
-                    args.signal_mode,  // kSignalMode
-                    to_string(args.major_sfb),
-                    get_compiled_dim(args.m, 'm', args.compiled_dims), get_compiled_dim(args.n, 'n', args.compiled_dims), get_compiled_dim(args.k, 'k', args.compiled_dims),
-                    args.num_groups,
-                    args.gemm_config.block_m, args.gemm_config.block_n, args.gemm_config.block_k,
-                    args.gemm_config.smem_config.swizzle_a_mode, args.gemm_config.smem_config.swizzle_b_mode, args.gemm_config.smem_config.swizzle_cd_mode,
-                    args.gemm_config.num_stages, args.gemm_config.num_last_stages,
-                    args.gemm_config.thread_config.num_tma_threads, args.gemm_config.thread_config.num_math_threads,
-                    args.gemm_config.multicast_config.num_multicast, args.gemm_config.multicast_config.is_multicast_on_a,
-                    args.gemm_config.num_sms, to_string(args.gemm_config.gemm_type),
-                    get_default_epilogue_type(args.epilogue_type));
+                break;
             default:
                 include_file = "deep_gemm/impls/sm90_fp8_gemm_1d2d.cuh";
                 kernel_name = "sm90_fp8_gemm_1d2d_impl";
@@ -107,6 +78,7 @@ using namespace deep_gemm;
 
 static void __instantiate_kernel() {{
     auto ptr = reinterpret_cast<void*>(&{}<
+        {},
         {},
         {}, {}, {},
         {},
@@ -122,6 +94,7 @@ static void __instantiate_kernel() {{
 )",
         // TODO: add CD dtype
         include_file, kernel_name,
+        args.signal_mode,  // kSignalMode
         to_string(args.major_sfb),
         get_compiled_dim(args.m, 'm', args.compiled_dims), get_compiled_dim(args.n, 'n', args.compiled_dims), get_compiled_dim(args.k, 'k', args.compiled_dims),
         args.num_groups,
@@ -136,8 +109,7 @@ static void __instantiate_kernel() {{
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
         // TODO: optimize `args` copy
-        // mode=8 (transpose_n_group_sbo) kernel always requires signal parameters in its signature
-        if (args.transpose_mode == 8) {
+        if (args.signal_mode > 0) {
             DG_CUDA_UNIFIED_CHECK(launch_kernel(kernel, config,
                 args.sfb, args.grouped_layout,
                 args.m, args.n, args.k,
@@ -600,6 +572,77 @@ static void sm90_m_grouped_fp8_gemm_masked_2d1d_transpose_n_group(const torch::T
     const auto& code = SM90FP8Gemm1D2DRuntime::generate(args);
     const auto& runtime = compiler->build("sm90_m_grouped_fp8_gemm_masked_2d1d_transpose_n_group", code);
     SM90FP8Gemm1D2DRuntime::launch(runtime, args);
+}
+
+static std::optional<std::pair<int, int>> sm90_m_grouped_fp8_gemm_masked_1d2d_sbo(const torch::Tensor& a, const torch::Tensor& sfa,
+                                                const torch::Tensor& b, const torch::Tensor& sfb,
+                                                const torch::Tensor& d,
+                                                const torch::Tensor& masked_m,
+                                                const int& num_groups, const int& m, const int& n, const int& k,
+                                                const int& expected_m,
+                                                const cute::UMMA::Major& major_a, const cute::UMMA::Major& major_b, const cute::UMMA::Major& major_sfb,
+                                                const std::string& compiled_dims,
+                                                const uint32_t* recv_signal,
+                                                uint32_t* send_signal) {
+    const auto& aligned_k = align(k, 128);
+    DG_HOST_ASSERT(d.scalar_type() == torch::kBFloat16);
+    DG_HOST_ASSERT(major_a == cute::UMMA::Major::K and major_b == cute::UMMA::Major::K);
+
+    const auto& config = get_best_config<SM90ArchSpec>(
+        GemmType::MGroupedMasked, KernelType::Kernel1D2D,
+        expected_m, n, k, num_groups, major_a, major_b,
+        torch::kFloat8_e4m3fn, d.scalar_type(), false,
+        device_runtime->get_num_sms());
+
+    // Requires no TMA splits
+    DG_HOST_ASSERT(config.smem_config.swizzle_a_mode == config.block_k);
+    DG_HOST_ASSERT(config.smem_config.swizzle_b_mode == config.block_k);
+    const auto& tensor_map_a = make_tma_a_desc(major_a, a, m, k,
+                                               SM90ArchSpec::get_ab_load_block_m(config.multicast_config, config.block_m),
+                                               config.block_k,
+                                               static_cast<int>(a.stride(get_non_contiguous_dim(major_a))), num_groups,
+                                               config.smem_config.swizzle_a_mode);
+    const auto& tensor_map_b = make_tma_b_desc(major_b, b, n, k,
+                                               SM90ArchSpec::get_ab_load_block_n(config.multicast_config, config.block_n),
+                                               config.block_k,
+                                               static_cast<int>(b.stride(get_non_contiguous_dim(major_b))), num_groups,
+                                               config.smem_config.swizzle_b_mode);
+    const auto& tensor_map_d = make_tma_cd_desc(d, m, n,
+                                                SM90ArchSpec::get_cd_store_block_m(config.block_m),
+                                                SM90ArchSpec::get_cd_store_block_n(config.block_n),
+                                                static_cast<int>(d.stride(-2)), num_groups,
+                                                config.smem_config.swizzle_cd_mode);
+    const auto& tensor_map_sfa = make_tma_sf_desc(cute::UMMA::Major::MN, sfa, m, k,
+                                                  config.block_m, config.block_k, num_groups, 0);
+    // Calculate signal_mode based on recv_signal and send_signal:
+    // 0: no signal, 1: recv only, 2: send only, 3: recv+send
+    const int signal_mode = (recv_signal != nullptr ? 1 : 0) | (send_signal != nullptr ? 2 : 0);
+    // Launch
+    const SM90FP8Gemm1D2DRuntime::Args& args = {
+        .major_sfb = major_sfb,
+        .m = m, .n = n, .k = aligned_k,
+        .num_groups = num_groups,
+        .transpose_mode = 5,
+        .signal_mode = signal_mode,
+        .compiled_dims = compiled_dims,
+        .epilogue_type = std::nullopt,
+        .gemm_config = config,
+        .launch_args = LaunchArgs(config.num_sms, config.thread_config.num_threads,
+                                  config.smem_config.smem_size,
+                                  config.multicast_config.num_multicast),
+        .sfb = sfb.data_ptr(),
+        .grouped_layout = masked_m.data_ptr(),
+        .tensor_map_a = tensor_map_a,
+        .tensor_map_b = tensor_map_b,
+        .tensor_map_d = tensor_map_d,
+        .tensor_map_sfa = tensor_map_sfa,
+        .recv_signal = recv_signal,
+        .send_signal = send_signal,
+    };
+    const auto& code = SM90FP8Gemm1D2DRuntime::generate(args);
+    const auto& runtime = compiler->build("sm90_m_grouped_fp8_gemm_masked_1d2d_sbo", code);
+    SM90FP8Gemm1D2DRuntime::launch(runtime, args);
+    return std::optional(std::make_pair(config.block_m, ceil_div(n, config.block_n)));
 }
 
 static std::optional<std::pair<int, int>> sm90_m_grouped_fp8_gemm_masked_2d1d_transpose_n_group_sbo(const torch::Tensor& a, const torch::Tensor& sfa,

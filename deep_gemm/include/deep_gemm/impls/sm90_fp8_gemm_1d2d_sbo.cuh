@@ -42,7 +42,7 @@ template <uint32_t kSignalMode,
           uint32_t kNumSMs, GemmType kGemmType,
           typename epilogue_type_t>
 __global__ __launch_bounds__(kNumTMAThreads + kNumMathThreads, 1) void
-sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
+sm90_fp8_gemm_1d2d_sbo_impl(float* sfb, int* grouped_layout,
                         uint32_t shape_m, uint32_t shape_n, uint32_t shape_k,
                         const __grid_constant__ cute::TmaDescriptor tensor_map_a,
                         const __grid_constant__ cute::TmaDescriptor tensor_map_b,
@@ -82,6 +82,7 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
     const uint32_t num_total_k_blocks = ceil_div(shape_k, BLOCK_K);
     const uint32_t warp_idx = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
     const uint32_t lane_idx = get_lane_idx();
+    const uint32_t num_block_tokens = ceil_div(shape_m, BLOCK_M);
 
     // Prefetch TMA descriptors at the very beginning
     if (warp_idx == kNumMathThreads / 32 and cute::elect_one_sync()) {
@@ -139,7 +140,11 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
 
     // Block scheduler
     uint32_t m_block_idx, n_block_idx;
-    auto scheduler = Scheduler<kGemmType, BLOCK_M, BLOCK_N, kNumGroups, kNumTMAMulticast, kIsTMAMulticastOnA, kNumSMs>(shape_m, shape_n, shape_k, grouped_layout);
+    auto scheduler = Scheduler<kGemmType, BLOCK_M, BLOCK_N, kNumGroups, kNumTMAMulticast, kIsTMAMulticastOnA, kNumSMs,
+                               512u,  // SF_K_ALIGNMENT (default)
+                               get_num_1d_blocks_per_group<kGemmType, BLOCK_M, BLOCK_N, kNumSMs, kIsTMAMulticastOnA>(),  // kNum1DBlocksPerGroup (default)
+                               false,   // kIsNGroupMasked
+                               kSignalMode>(shape_m, shape_n, shape_k, grouped_layout);
 
     // Pipeline and TMA phases
     uint32_t stage_idx = 0, phase = 0;
@@ -159,7 +164,7 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
         // We use the third warp, as warp 0/1 may be doing WGMMA with `BLOCK_M == 32`
         if (warp_idx == kNumMathThreads / 32 + 2 and cute::elect_one_sync()) {
             // Persistently schedule over blocks
-            while (scheduler.get_next_block(m_block_idx, n_block_idx)) {
+            while (scheduler.get_next_block(m_block_idx, n_block_idx, recv_signal)) {
                 // Assign TMA multicast number into A and B
                 // NOTES: there may be additional odd rows/columns or cases where multicast is not possible.
                 const bool is_tma_multicast_valid = scheduler.is_tma_multicast_valid(m_block_idx);
@@ -210,7 +215,7 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
         const uint32_t b_desc_lo = __shfl_sync(0xffffffff, b_desc.reg32_[0], 0);
 
         // Persistently schedule over blocks
-        while (scheduler.get_next_block(m_block_idx, n_block_idx)) {
+        while (scheduler.get_next_block(m_block_idx, n_block_idx, recv_signal)) {
             // Decide the number of scales B to load
             DG_TRAP_ONLY_DEVICE_ASSERT(shape_n % 8 == 0);
             uint32_t num_former_iters = BLOCK_N / 8, num_full_iters = num_former_iters;
@@ -420,6 +425,15 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
                 cute::tma_store_arrive();
             }
             __syncwarp();
+            if constexpr (SignalModeTraits<kSignalMode>::kEnableSendSignal) {
+                if (threadIdx.x < BLOCK_N / TMA_D_BLOCK_N) {
+                    asm volatile("cp.async.bulk.wait_group 0;\n" ::: "memory");
+                }
+                cutlass::arch::NamedBarrier(kNumMathThreads).sync();
+                if (threadIdx.x == 0) {
+                    atomic_add_release_global_32(send_signal + scheduler.current_group_idx * num_block_tokens + m_block_idx, 1); 
+                }
+            }
         }
     }
 #else

@@ -30,7 +30,8 @@ __device__ void dispatch_num_former_iters(uint32_t num_former_iters, const func_
         dispatch_num_former_iters<kNumFormerIters + kGap, kGap, kEnd>(num_former_iters, func);
 }
 
-template <cute::UMMA::Major kMajorSFA,
+template <uint32_t kSignalMode,
+          cute::UMMA::Major kMajorSFA,
           uint32_t SHAPE_M, uint32_t SHAPE_N, uint32_t SHAPE_K,
           uint32_t kNumGroups,
           uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K,

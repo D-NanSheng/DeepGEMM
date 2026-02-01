@@ -270,6 +270,45 @@ def test_m_grouped_gemm_masked_2d1d_transpose_n_group() -> None:
               f'{(count_bytes(a, d) * valid_n / (max_n * num_groups) + count_bytes(b)) / 1e9 / t:4.0f} GB/s')
     print()
 
+def test_m_grouped_gemm_masked_sbo() -> None:
+    print('Testing m-grouped masked SBO GEMM:')
+
+    # TODO: when the actual `m` is greater than `expected_m_per_group`, efficiency may significantly decrease.
+    for kernel_type, num_groups, max_m, expected_m_per_group, n, k in enumerate_m_grouped_masked(torch.float8_e4m3fn):
+        kernel_opt = f'1D1D' if kernel_type.is_1d1d() else '1D2D'
+        use_ue8m0 = get_ue8m0_usage(kernel_type)
+        disable_ue8m0_cast = not use_ue8m0
+
+        # Test correctness
+        for i in range(10):
+            recv_signal = torch.ones(num_groups, device='cuda', dtype=torch.int32)
+            send_signal = torch.zeros(num_groups*((max_m+64)//64), device='cuda', dtype=torch.int32)
+            a, b, masked_m, d, ref_d = generate_m_grouped_masked(num_groups, max_m, expected_m_per_group, n, k, use_ue8m0=use_ue8m0)
+            deep_gemm.m_grouped_fp8_gemm_nt_sbo_masked(a, b, d, masked_m, expected_m_per_group, disable_ue8m0_cast=disable_ue8m0_cast, recv_signal=recv_signal.data_ptr(), send_signal=send_signal.data_ptr())
+            for j in range(num_groups):
+                if masked_m[j].item() == 0:
+                    continue
+                diff = calc_diff(d[j, :masked_m[j].item()], ref_d[j, :masked_m[j].item()])
+                assert diff < 0.001, f'{max_m=}, {n=}, {k=}, {j=}, masked_m={masked_m[j]}, {kernel_opt}, {num_groups=}, {diff:.5f}'
+
+        # Construct full cases
+        recv_signal = torch.ones(num_groups, device='cuda', dtype=torch.int32)
+        send_signal = torch.zeros(num_groups*((max_m+64)//64), device='cuda', dtype=torch.int32)
+        a, b, masked_m, d, ref_d = generate_m_grouped_masked(num_groups, max_m, expected_m_per_group, n, k, use_ue8m0=use_ue8m0)
+
+        # noinspection PyShadowingNames
+        def test_func():
+            deep_gemm.m_grouped_fp8_gemm_nt_sbo_masked(a, b, d, masked_m, expected_m_per_group, disable_ue8m0_cast=disable_ue8m0_cast, recv_signal=recv_signal.data_ptr(), send_signal=send_signal.data_ptr())
+
+        # Test performance with fixed shapes
+        valid_m = masked_m.sum().item()
+        t = bench_kineto(test_func, 'fp8_gemm', suppress_kineto_output=True)
+        print(f' > Perf ({num_groups=}, expected_m_per_group={expected_m_per_group:4}, n={n:4}, k={k:4}, {kernel_opt}): '
+              f'{t * 1e6:4.0f} us | '
+              f'{2 * valid_m * n * k / t / 1e12:4.0f} TFLOPS | '
+              f'{(count_bytes(a, d) * valid_m / (max_m * num_groups) + count_bytes(b)) / 1e9 / t:4.0f} GB/s')
+    print()
+
 def test_m_grouped_gemm_masked_2d1d_transpose_n_group_sbo() -> None:
     print('Testing m-grouped masked 2d1d transpose n-group SBO GEMM:')
 
@@ -307,8 +346,31 @@ def test_m_grouped_gemm_masked_2d1d_transpose_n_group_sbo() -> None:
               f'{t * 1e6:4.0f} us | '
               f'{2 * m * valid_n * k / t / 1e12:4.0f} TFLOPS | '
               f'{(count_bytes(a, d) * valid_n / (max_n * num_groups) + count_bytes(b)) / 1e9 / t:4.0f} GB/s')
-        print(f'recv_signal non-zero: {recv_signal[recv_signal != 0]}')
-        print(f'send_signal non-zero: {send_signal[send_signal != 0]}')
+        # print(f'recv_signal non-zero: {recv_signal[recv_signal != 0]}')
+        # print(f'send_signal non-zero: {send_signal[send_signal != 0]}')
+
+        # # Test with recv_signal = nullptr (send_signal only, signal_mode = 2)
+        # send_signal_only = torch.zeros(num_groups*((max_n+15)//16), device='cuda', dtype=torch.int32)
+        # a, b, masked_n, d, ref_d = generate_m_grouped_masked_2d1d_transpose_n_group(num_groups, max_n, m, expected_n_per_group, k, use_ue8m0=use_ue8m0)
+        # deep_gemm.m_grouped_fp8_gemm_tn_transpose_n_group_sbo_masked(a, b, d, masked_n, expected_n_per_group, disable_ue8m0_cast=disable_ue8m0_cast, recv_signal=0, send_signal=send_signal_only.data_ptr())
+        # for j in range(num_groups):
+        #     if masked_n[j].item() == 0:
+        #         continue
+        #     diff = calc_diff(d[j, :masked_n[j].item()], ref_d[j, :masked_n[j].item()])
+        #     assert diff < 0.001, f'recv_signal=nullptr test failed: {max_n=}, {m=}, {k=}, {j=}, masked_n={masked_n[j]}, {kernel_opt}, {num_groups=}, {diff:.5f}'
+        # print(f' > recv_signal=nullptr test passed, send_signal non-zero: {send_signal_only[send_signal_only != 0]}')
+
+        # # Test with send_signal = nullptr (recv_signal only, signal_mode = 1)
+        # recv_signal_only = torch.ones(num_groups, device='cuda', dtype=torch.int32)
+        # a, b, masked_n, d, ref_d = generate_m_grouped_masked_2d1d_transpose_n_group(num_groups, max_n, m, expected_n_per_group, k, use_ue8m0=use_ue8m0)
+        # deep_gemm.m_grouped_fp8_gemm_tn_transpose_n_group_sbo_masked(a, b, d, masked_n, expected_n_per_group, disable_ue8m0_cast=disable_ue8m0_cast, recv_signal=recv_signal_only.data_ptr(), send_signal=0)
+        # for j in range(num_groups):
+        #     if masked_n[j].item() == 0:
+        #         continue
+        #     diff = calc_diff(d[j, :masked_n[j].item()], ref_d[j, :masked_n[j].item()])
+        #     assert diff < 0.001, f'send_signal=nullptr test failed: {max_n=}, {m=}, {k=}, {j=}, masked_n={masked_n[j]}, {kernel_opt}, {num_groups=}, {diff:.5f}'
+        # print(f' > send_signal=nullptr test passed')
+
     print()
 
 def test_k_grouped_gemm_contiguous() -> None:
@@ -361,6 +423,7 @@ if __name__ == '__main__':
     # test_m_grouped_gemm_masked_2d1d()
     # test_m_grouped_gemm_masked_2d1d_transpose()
     # test_m_grouped_gemm_masked_2d1d_n_group()
+    test_m_grouped_gemm_masked_sbo()
     test_m_grouped_gemm_masked_2d1d_transpose_n_group()
     test_m_grouped_gemm_masked_2d1d_transpose_n_group_sbo()
     # print('\n' + '='*50)
