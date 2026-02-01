@@ -439,7 +439,7 @@ static void m_grouped_fp8_gemm_tn_transpose_n_group_masked(const std::pair<torch
     }
 }
 
-static void m_grouped_fp8_gemm_tn_transpose_n_group_sbo_masked(const std::pair<torch::Tensor, torch::Tensor>& a,
+static std::optional<std::pair<int, int>> m_grouped_fp8_gemm_tn_transpose_n_group_sbo_masked(const std::pair<torch::Tensor, torch::Tensor>& a,
                                          const std::pair<torch::Tensor, torch::Tensor>& b,
                                          const torch::Tensor& d,
                                          const torch::Tensor& masked_n,
@@ -483,13 +483,15 @@ static void m_grouped_fp8_gemm_tn_transpose_n_group_sbo_masked(const std::pair<t
 
     // Dispatch implementation
     const auto& arch_major = device_runtime->get_arch_major();
+    std::optional<std::pair<int, int>> result = std::nullopt;
     if (arch_major == 9 and sfa.scalar_type() == torch::kFloat) {
         const auto& major_sfa = get_major_type_ab(sfa);
-        sm90_m_grouped_fp8_gemm_masked_2d1d_transpose_n_group_sbo(a.first, sfa, b.first, sfb, d, masked_n,
+        result = sm90_m_grouped_fp8_gemm_masked_2d1d_transpose_n_group_sbo(a.first, sfa, b.first, sfb, d, masked_n,
                                             num_groups, m, n, k, expected_n, major_a, major_b, major_sfa, compiled_dims, recv_signal, send_signal);
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture or scaling factor types");
     }
+    return result;
 }
 
 static void k_grouped_fp8_gemm_tn_contiguous(const std::pair<torch::Tensor, torch::Tensor>& a,

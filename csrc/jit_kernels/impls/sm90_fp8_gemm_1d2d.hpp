@@ -602,7 +602,7 @@ static void sm90_m_grouped_fp8_gemm_masked_2d1d_transpose_n_group(const torch::T
     SM90FP8Gemm1D2DRuntime::launch(runtime, args);
 }
 
-static void sm90_m_grouped_fp8_gemm_masked_2d1d_transpose_n_group_sbo(const torch::Tensor& a, const torch::Tensor& sfa,
+static std::optional<std::pair<int, int>> sm90_m_grouped_fp8_gemm_masked_2d1d_transpose_n_group_sbo(const torch::Tensor& a, const torch::Tensor& sfa,
                                                 const torch::Tensor& b, const torch::Tensor& sfb,
                                                 const torch::Tensor& d,
                                                 const torch::Tensor& masked_n,
@@ -672,6 +672,7 @@ static void sm90_m_grouped_fp8_gemm_masked_2d1d_transpose_n_group_sbo(const torc
     const auto& code = SM90FP8Gemm1D2DRuntime::generate(args);
     const auto& runtime = compiler->build("sm90_m_grouped_fp8_gemm_masked_2d1d_transpose_n_group_sbo", code);
     SM90FP8Gemm1D2DRuntime::launch(runtime, args);
+    return std::optional(std::make_pair(config.block_n, ceil_div(m, config.block_m)));
 }
 
 } // namespace deep_gemm
