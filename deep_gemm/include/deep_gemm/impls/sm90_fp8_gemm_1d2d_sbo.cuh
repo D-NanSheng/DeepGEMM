@@ -47,7 +47,8 @@ sm90_fp8_gemm_1d2d_sbo_impl(float* sfb, int* grouped_layout,
                         const __grid_constant__ cute::TmaDescriptor tensor_map_a,
                         const __grid_constant__ cute::TmaDescriptor tensor_map_b,
                         const __grid_constant__ cute::TmaDescriptor tensor_map_d,
-                        const __grid_constant__ cute::TmaDescriptor tensor_map_sfa) {
+                        const __grid_constant__ cute::TmaDescriptor tensor_map_sfa,
+                        const uint32_t* recv_signal, uint32_t* send_signal) {
 #if (defined(__CUDA_ARCH__) and (__CUDA_ARCH__ >= 900)) or defined(__CLION_IDE__)
     // Scaling checks
     DG_STATIC_ASSERT(BLOCK_K == 128, "Only support per-128-channel FP8 scaling");
