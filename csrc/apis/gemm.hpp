@@ -100,6 +100,62 @@ static void fp8_gemm_nt(const std::pair<torch::Tensor, torch::Tensor>& a,
     }
 }
 
+static void fp8_gemm_tn_transpose(const std::pair<torch::Tensor, torch::Tensor>& a,
+                        const std::pair<torch::Tensor, torch::Tensor>& b,
+                        const torch::Tensor& d,
+                        const std::optional<torch::Tensor>& c,
+                        std::optional<std::tuple<int, int, int>> recipe,
+                        const std::string& compiled_dims,
+                        const bool& disable_ue8m0_cast) {
+    // Shape must be `[M, K] @ [N, K].T`
+    const auto& major_a = get_major_type_ab(a.first);
+    const auto& major_b = get_major_type_ab(b.first);
+    if (fp8_requires_k_major()) {
+        DG_HOST_ASSERT(major_a == cute::UMMA::Major::K);
+        DG_HOST_ASSERT(major_b == cute::UMMA::Major::K);
+    }
+
+    // C/D must be N-major
+    check_major_type_cd(d);
+
+    // Type and shape checks
+    const auto& [m , k ] = get_shape<2>(a.first);
+    const auto& [n , k_] = get_shape<2>(b.first);
+    const auto& [n_, m_] = get_shape<2>(d); // 输出是转置的
+    DG_HOST_ASSERT(m == m_ and n == n_ and k == k_);
+    DG_HOST_ASSERT(a.first.scalar_type() == torch::kFloat8_e4m3fn);
+    DG_HOST_ASSERT(b.first.scalar_type() == torch::kFloat8_e4m3fn);
+    DG_HOST_ASSERT(d.scalar_type() == torch::kBFloat16 or d.scalar_type() == torch::kFloat);
+
+    // Early return for trivial cases
+    if (early_return(m, n, k, d, c))
+        return;
+
+    // Transform SFA and SFB into compute-required layout
+    if (not recipe.has_value())
+        recipe = get_default_recipe(a.second.scalar_type(), b.second.scalar_type());
+    DG_HOST_ASSERT(recipe.value() == std::make_tuple(1, 1, 128) or recipe.value() == std::make_tuple(1, 128, 128));
+    const auto& sfa = layout::transform_sf_into_required_layout(a.second, m, k, recipe.value(), std::nullopt,  false, disable_ue8m0_cast); // <128, 128>
+    const auto& sfb = layout::transform_sf_into_required_layout(b.second, n, k, recipe.value(), std::nullopt, true, disable_ue8m0_cast); // scale<1,128>
+
+    // Dispatch into different implements
+    const auto& arch_major = device_runtime->get_arch_major();
+    if (arch_major == 9 and sfa.scalar_type() == torch::kFloat) {
+        if (std::get<1>(recipe.value()) == 1) {
+            DG_HOST_UNREACHABLE("fp8_gemm_tn_transpose unsupported for 1D1D");
+            // sm90_fp8_gemm_1d1d(a.first, sfa, b.first, sfb, c, d, m, n, k, major_a, major_b, compiled_dims);
+        } else {
+            const auto& major_sfa = get_major_type_ab(sfa);
+            sm90_fp8_gemm_2d1d_transpose(a.first, sfa, b.first, sfb, c, d, m, n, k, major_a, major_b, major_sfa, compiled_dims);
+        }
+    } else if (arch_major == 10 and sfa.scalar_type() == torch::kInt) {
+        DG_HOST_UNREACHABLE("Unsupported architecture or scaling factor types");
+        // sm100_fp8_gemm_1d1d(a.first, sfa, b.first, sfb, c, d, m, n, k, major_a, major_b, compiled_dims);
+    } else {
+        DG_HOST_UNREACHABLE("Unsupported architecture or scaling factor types");
+    }
+}
+
 static void fp8_gemm_nn(const std::pair<torch::Tensor, torch::Tensor>& a,
                         const std::pair<torch::Tensor, torch::Tensor>& b,
                         const torch::Tensor& d,
@@ -867,6 +923,11 @@ static void register_apis(pybind11::module_& m) {
 #if DG_FP8_COMPATIBLE and DG_TENSORMAP_COMPATIBLE
     // FP8 GEMMs
     m.def("fp8_gemm_nt", &fp8_gemm_nt,
+          py::arg("a"), py::arg("b"), py::arg("d"),
+          py::arg("c") = std::nullopt, py::arg("recipe") = std::nullopt,
+          py::arg("compiled_dims") = "nk",
+          py::arg("disable_ue8m0_cast") = false);
+    m.def("fp8_gemm_tn_transpose", &fp8_gemm_tn_transpose,
           py::arg("a"), py::arg("b"), py::arg("d"),
           py::arg("c") = std::nullopt, py::arg("recipe") = std::nullopt,
           py::arg("compiled_dims") = "nk",
