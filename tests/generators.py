@@ -92,6 +92,10 @@ def enumerate_normal(dtype: torch.dtype) -> Generator:
                 yield override_kernel_type, n, m, k, override_major,     override_major, True,  torch.float        # Wgrad
                 yield override_kernel_type, n, m, k, override_major,     override_major, False, torch.bfloat16     # Wgrad
 
+def enumerate_normal_transpose(dtype: torch.dtype) -> Generator:
+    for m in (8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096):
+        for n, k in ((7168, 2048), ):
+            yield (KernelType.Kernel1D2D, ), n, m, k, MajorTypeAB.KMajor, MajorTypeAB.KMajor, False, torch.bfloat16
 
 def enumerate_m_grouped_contiguous(dtype: torch.dtype) -> Generator:
     for kernel_type in get_kernel_types(dtype):
@@ -182,6 +186,29 @@ def generate_normal(m: int, n: int, k: int,
     b_fp8 = b_fp8 if major_b.is_k_major() else (b_fp8[0].T.contiguous().T, b_fp8[1])
     return a_fp8, b_fp8, c, d, ref_d
 
+
+def generate_normal_2d1d_transpose(m: int, n: int, k: int,
+                    major_a: MajorTypeAB, major_b: MajorTypeAB,
+                    accumulate: bool, out_dtype: torch.dtype,
+                    kernel_type: KernelType,
+                    use_ue8m0: bool = False, use_bf16: bool = False):
+    a = torch.randn((m, k), device='cuda', dtype=torch.bfloat16)
+    b = torch.randn((n, k), device='cuda', dtype=torch.bfloat16)
+    d = torch.randn((n, m), device='cuda', dtype=out_dtype) * 32 if accumulate else \
+        torch.empty((n, m), device='cuda', dtype=out_dtype)
+    c = d if accumulate else None
+    ref_d = (a.float() @ b.float().t() + (c if accumulate else 0)).to(out_dtype).transpose(1, 0)
+    if kernel_type.is_1d1d() or accumulate:
+        raise NotImplementedError("2D1D transpose not implemented for 1D1D kernels")
+    if not major_a.is_k_major() or not major_b.is_k_major():
+        raise NotImplementedError("2D1D transpose not implemented for non-k-major layouts")
+    if use_bf16:
+        return a, b, c, d, ref_d
+
+    a_fp8 = per_block_cast_to_fp8(a, use_ue8m0=use_ue8m0)
+    b_fp8 = per_token_cast_to_fp8(b, use_ue8m0=use_ue8m0)
+    
+    return a_fp8, b_fp8, c, d, ref_d
 
 def generate_m_grouped_contiguous(num_groups: int, expected_m_per_group: int, n: int, k: int,
                                   major_a: MajorTypeAB, major_b: MajorTypeAB,
