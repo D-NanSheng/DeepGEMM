@@ -93,9 +93,10 @@ def enumerate_normal(dtype: torch.dtype) -> Generator:
                 yield override_kernel_type, n, m, k, override_major,     override_major, False, torch.bfloat16     # Wgrad
 
 def enumerate_normal_transpose(dtype: torch.dtype) -> Generator:
-    for m in (8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096):
-        for n, k in ((7168, 2048), ):
-            yield (KernelType.Kernel1D2D, ), n, m, k, MajorTypeAB.KMajor, MajorTypeAB.KMajor, False, torch.bfloat16
+    for kernel_type in get_kernel_types(dtype):
+        for m in (8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096):
+            for n, k in ((7168, 2048), ):
+                yield kernel_type, n, m, k, MajorTypeAB.KMajor, MajorTypeAB.KMajor, False, torch.bfloat16
 
 def enumerate_m_grouped_contiguous(dtype: torch.dtype) -> Generator:
     for kernel_type in get_kernel_types(dtype):

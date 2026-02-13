@@ -226,7 +226,7 @@ static void sm90_fp8_gemm_2d1d_transpose(const torch::Tensor& a, const torch::Te
                                                config.block_k,
                                                static_cast<int>(b.stride(get_non_contiguous_dim(major_b))), 1,
                                                config.smem_config.swizzle_b_mode);
-    const auto& tensor_map_d = make_tma_cd_desc(d, static_cast<int>(d.size(-1)), m,
+    const auto& tensor_map_d = make_tma_cd_desc(d, n, m,
                                                 SM90ArchSpec::get_cd_store_block_n(config.block_n),
                                                 SM90ArchSpec::get_cd_store_block_m(config.block_m),
                                                 static_cast<int>(d.stride(-2)), 1,

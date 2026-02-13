@@ -61,7 +61,6 @@ def test_gemm() -> None:
 
 def test_gemm_2d1d_transpose() -> None:
     print('Testing GEMM 2D1D transpose:')
-    scores = []
     for kernel_type, m, n, k, major_a, major_b, accumulate, out_dtype in enumerate_normal_transpose(torch.float8_e4m3fn):
         major_opt  = 'N' if major_a.is_k_major() else 'T'
         major_opt += 'T' if major_b.is_k_major() else 'N'
@@ -83,17 +82,11 @@ def test_gemm_2d1d_transpose() -> None:
         a, b, c, d, ref_d = generate_normal_2d1d_transpose(m, n, k, major_a, major_b, accumulate, out_dtype, kernel_type, use_ue8m0=use_ue8m0)
         t = bench_kineto(lambda: deep_gemm.fp8_gemm_tn_transpose(a, b, d, c=c, disable_ue8m0_cast=disable_ue8m0_cast, recipe=recipe),
                          'fp8_gemm', suppress_kineto_output=True)
-        cublas_t, split_k_t = bench_kineto(lambda: deep_gemm.cublaslt_gemm_nt(a[0], b[0], d, c=c), ('nvjet', 'reduce'), suppress_kineto_output=True)
+        # Skip cuBLAS comparison: transpose version outputs (n, m) shape while cublaslt_gemm_nt expects (m, n)
         print(f' > Perf (m={m:6}, n={n:6}, k={k:6}, {kernel_opt}, layout={major_opt}, {out_opt}, {acc_opt}): '
               f'{t * 1e6:6.1f} us | {2 * m * n * k / t / 1e12:4.0f} TFLOPS | '
-              f'{(count_bytes(a, b, d) + count_bytes(c) * int(accumulate)) / 1e9 / t:4.0f} GB/s | '
-              f'{(cublas_t + split_k_t) / t:.2f}x cuBLAS')
-        if cublas_t > 0:
-            scores.append((cublas_t + split_k_t) / t)
-    if len(scores) > 0:
-        print(f"Average speedup over cuBLASLt: {float(np.prod(scores)) ** (1.0 / len(scores)):.3f}x\n")
-    else:
-        print("No valid scores to compute average speedup.\n")
+              f'{(count_bytes(a, b, d) + count_bytes(c) * int(accumulate)) / 1e9 / t:4.0f} GB/s')
+    print()
 
 def test_m_grouped_gemm_contiguous() -> None:
     print('Testing m-grouped contiguous GEMM:')
@@ -453,14 +446,15 @@ if __name__ == '__main__':
     os.environ['GPS_BLOCK_M'] = str(0)
     os.environ['GPS_BLOCK_N'] = str(0)
     # test_gemm()
+    test_gemm_2d1d_transpose()
     # os.environ['GPS_IGNORE_STAGES_LIMIT'] = str(1)
     # test_m_grouped_gemm_masked()
     # test_m_grouped_gemm_masked_2d1d()
     # test_m_grouped_gemm_masked_2d1d_transpose()
     # test_m_grouped_gemm_masked_2d1d_n_group()
-    test_m_grouped_gemm_masked_sbo()
-    test_m_grouped_gemm_masked_2d1d_transpose_n_group()
-    test_m_grouped_gemm_masked_2d1d_transpose_n_group_sbo()
+    # test_m_grouped_gemm_masked_sbo()
+    # test_m_grouped_gemm_masked_2d1d_transpose_n_group()
+    # test_m_grouped_gemm_masked_2d1d_transpose_n_group_sbo()
     # print('\n' + '='*50)
     # print('Testing different BLOCK_M and BLOCK_N configurations:')
     # # 不能用的配置(64, 152)
