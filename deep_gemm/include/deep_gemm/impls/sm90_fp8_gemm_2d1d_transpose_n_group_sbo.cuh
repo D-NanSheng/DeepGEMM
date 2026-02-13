@@ -335,7 +335,7 @@ sm90_fp8_gemm_2d1d_transpose_n_group_sbo_impl(float* sfa, int* grouped_layout,
                             #pragma unroll
                             for (uint32_t i = 0; i < WGMMA::kNumAccum / 4; ++ i) {
                                 // NOTES: for unrolled `num_former_iters` cases, we expect the compiler to automatically make it a constant
-                                bool predicate = kMustUseUniformedScaleA or i < num_former_iters;
+                                bool predicate = kMustUseUniformedScaleA or local_idx == 0; // local_idx == 0的时候，最多是第一个 BM=128的块，当local_idx == 1的时候，就是第二个 BM=128的块
                                 cloumn_scale_0 = predicate ? scale_b[i].x * scale_a_0 : scale_b[i].x * scale_a_1;
                                 cloumn_scale_1 = predicate ? scale_b[i].y * scale_a_0 : scale_b[i].y * scale_a_1;
                                 shifted_accum[i * 4 + 0] += cloumn_scale_0 * accum[i * 4 + 0];

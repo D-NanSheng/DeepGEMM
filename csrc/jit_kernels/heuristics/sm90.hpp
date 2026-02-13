@@ -12,8 +12,7 @@ struct SM90ArchSpec {
     static constexpr int smem_capacity = 232448;
     
     static std::vector<int> get_block_m_candidates(const KernelType& kernel_type, const cute::UMMA::Major& major_a, const int& m) {
-        // std::vector<int> candidates{64, 128, 256};
-        std::vector<int> candidates{64, 128}; // Exclude 256 for sm90_fp8_gemm_2d1d_transpose, the reason is unknown, to be investigated(todo)
+        std::vector<int> candidates{64, 128, 256};
         if ((kernel_type == KernelType::Kernel1D2D or kernel_type == KernelType::KernelNoSF) and major_a == cute::UMMA::Major::K) {
             // NOTES: `block_m = 16/32` is smaller than MMA M size, should be careful in handling this
             if (m <= 16) candidates.push_back(16);
